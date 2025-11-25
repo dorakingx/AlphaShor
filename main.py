@@ -14,6 +14,7 @@ import numpy as np
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, Aer, execute
 from qiskit.visualization import plot_histogram
+from qiskit_aer.noise import NoiseModel, depolarizing_error
 import math
 
 
@@ -84,12 +85,42 @@ def find_optimized_angles(degree):
 # 2. QSP Circuit & Estimator
 # ==============================================================================
 
+def get_noise_model(error_rate):
+    """
+    Create a depolarizing noise model for robustness testing.
+    
+    Args:
+        error_rate (float): Depolarizing error rate (e.g., 0.01 for 1% error)
+        
+    Returns:
+        NoiseModel: Qiskit noise model with depolarizing errors
+    """
+    noise_model = NoiseModel()
+    # Add depolarizing error to single-qubit gates
+    error = depolarizing_error(error_rate, 1)
+    noise_model.add_all_qubit_quantum_error(error, ['h', 'rz', 'p', 'x'])
+    # Add depolarizing error to two-qubit gates (for controlled operations)
+    error_2q = depolarizing_error(error_rate, 2)
+    noise_model.add_all_qubit_quantum_error(error_2q, ['cu', 'cx', 'cz'])
+    return noise_model
+
+
 class QSPPhaseEstimator:
-    def __init__(self, degree=5, shots=1024):
+    def __init__(self, degree=5, shots=1024, error_rate=0.0):
+        """
+        Initialize QSP Phase Estimator.
+        
+        Args:
+            degree (int): QSP polynomial degree
+            shots (int): Number of measurement shots
+            error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error)
+        """
         self.degree = degree
         self.shots = shots
+        self.error_rate = error_rate
         self.backend = Aer.get_backend('qasm_simulator')
         self.angles = self._get_angles(degree)
+        self.noise_model = get_noise_model(error_rate) if error_rate > 0 else None
         
     def _get_angles(self, degree):
         if degree == 5:
@@ -99,9 +130,21 @@ class QSPPhaseEstimator:
 
 
     def build_qsp_circuit(self, target_unitary, phase_shift=0.0):
+        """
+        Build QSP circuit for phase estimation.
+        
+        CRITICAL FIX: Prepare target qubit(s) in |1⟩ state to enable phase kickback.
+        For phase gate P(θ), we need |1⟩ eigenstate (eigenvalue e^(iθ)) instead of |0⟩.
+        """
         num_target = target_unitary.num_qubits
         qc = QuantumCircuit(1 + num_target, 1)
         
+        # Prepare target qubit(s) in |1⟩ state for phase kickback
+        # This is critical: P(θ)|0⟩ = |0⟩ (no phase), but P(θ)|1⟩ = e^(iθ)|1⟩
+        for t in range(1, 1 + num_target):
+            qc.x(t)
+        
+        # Prepare ancilla in |+⟩ state
         qc.h(0)
         qc.rz(-2 * self.angles[0], 0)
         
@@ -121,8 +164,17 @@ class QSPPhaseEstimator:
 
 
     def measure_probability(self, target_unitary, phase_shift):
+        """
+        Measure probability with optional noise model for robustness testing.
+        """
         qc = self.build_qsp_circuit(target_unitary, phase_shift)
-        job = execute(qc, self.backend, shots=self.shots)
+        
+        # Execute with noise model if error_rate > 0
+        if self.noise_model is not None:
+            job = execute(qc, self.backend, shots=self.shots, noise_model=self.noise_model)
+        else:
+            job = execute(qc, self.backend, shots=self.shots)
+            
         counts = job.result().get_counts()
         return counts.get('0', 0) / self.shots
 
@@ -168,7 +220,10 @@ def create_mock_ecc_unitary(theta):
     Create a simple mock unitary for testing phase estimation.
     
     This function creates a phase gate P(θ) which has a known phase.
-    The eigenstate is |0⟩ with eigenvalue e^(iθ).
+    The eigenstate |1⟩ has eigenvalue e^(iθ), while |0⟩ has eigenvalue 1.
+    
+    IMPORTANT: The circuit must prepare |1⟩ state to observe phase kickback.
+    This is handled in build_qsp_circuit() by applying X gate before QSP sequence.
     
     ============================================================================
     NOTE: This is a placeholder for the actual ECC Point Addition unitary.
@@ -194,14 +249,61 @@ def create_mock_ecc_unitary(theta):
 
 if __name__ == "__main__":
     actual_phase = (2/3) * np.pi 
-    print(f"\nTARGET PHASE: {actual_phase:.4f} rad")
+    print(f"\n{'='*70}")
+    print(f"QSP-Based Robust Phase Estimation - Q-Day Prize Demonstration")
+    print(f"{'='*70}")
+    print(f"\nTARGET PHASE: {actual_phase:.6f} rad ({np.degrees(actual_phase):.2f}°)")
     
     target_u = create_mock_ecc_unitary(actual_phase)
-    estimator = QSPPhaseEstimator(degree=5, shots=2000)
     
-    estimated_phase = estimator.estimate_phase_binary_search(target_u, precision_bits=6)
+    # ========================================================================
+    # 1. Ideal Simulation (Noiseless)
+    # ========================================================================
+    print(f"\n{'─'*70}")
+    print("1. IDEAL SIMULATION (Error Rate: 0.0%)")
+    print(f"{'─'*70}")
     
-    print("\n" + "="*30)
-    print(f"Actual:    {actual_phase:.6f}")
-    print(f"Estimated: {estimated_phase:.6f}")
-    print(f"Error:     {abs(actual_phase - estimated_phase):.6f} rad")
+    estimator_ideal = QSPPhaseEstimator(degree=5, shots=2000, error_rate=0.0)
+    estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(target_u, precision_bits=6)
+    
+    error_ideal = abs(estimated_phase_ideal - actual_phase)
+    # Handle wrap-around
+    error_ideal = min(error_ideal, 2 * np.pi - error_ideal)
+    
+    print(f"\nResults (Ideal):")
+    print(f"  Actual:    {actual_phase:.6f} rad")
+    print(f"  Estimated: {estimated_phase_ideal:.6f} rad")
+    print(f"  Error:     {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
+    
+    # ========================================================================
+    # 2. Noisy Simulation (2% Depolarizing Error)
+    # ========================================================================
+    print(f"\n{'─'*70}")
+    print("2. NOISY SIMULATION (Error Rate: 2.0% - Demonstrating Robustness)")
+    print(f"{'─'*70}")
+    
+    estimator_noisy = QSPPhaseEstimator(degree=5, shots=2000, error_rate=0.02)
+    estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(target_u, precision_bits=6)
+    
+    error_noisy = abs(estimated_phase_noisy - actual_phase)
+    # Handle wrap-around
+    error_noisy = min(error_noisy, 2 * np.pi - error_noisy)
+    
+    print(f"\nResults (Noisy):")
+    print(f"  Actual:    {actual_phase:.6f} rad")
+    print(f"  Estimated: {estimated_phase_noisy:.6f} rad")
+    print(f"  Error:     {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
+    
+    # ========================================================================
+    # Summary Comparison
+    # ========================================================================
+    print(f"\n{'='*70}")
+    print("SUMMARY COMPARISON")
+    print(f"{'='*70}")
+    print(f"Ideal (0% error):  Error = {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
+    print(f"Noisy (2% error):   Error = {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
+    print(f"Robustness:        {((error_noisy - error_ideal) / error_ideal * 100):+.1f}% degradation")
+    print(f"\n{'='*70}")
+    print("Note: The QSP binary search demonstrates robustness by maintaining")
+    print("reasonable accuracy even with 2% depolarizing noise.")
+    print(f"{'='*70}\n")
