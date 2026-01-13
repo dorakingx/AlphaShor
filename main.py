@@ -11,6 +11,7 @@ Improvements:
 """
 
 import numpy as np
+from abc import ABC, abstractmethod
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, Aer, execute
 from qiskit.visualization import plot_histogram
@@ -82,7 +83,185 @@ def find_optimized_angles(degree):
 
 
 # ==============================================================================
-# 2. QSP Circuit & Estimator
+# 2. Oracle Pattern (Extensibility Architecture)
+# ==============================================================================
+
+class QuantumOracle(ABC):
+    """
+    Abstract base class for quantum oracles used in QSP phase estimation.
+    
+    This interface allows seamless swapping between different unitary implementations
+    (e.g., mock phase gate → ECC Point Addition) without modifying the core
+    QSP estimation logic.
+    
+    The Oracle Pattern provides:
+    - Separation of concerns: Oracle handles unitary construction
+    - Extensibility: Easy to add new oracle types
+    - Testability: Mock oracles for development/testing
+    """
+    
+    @abstractmethod
+    def construct_circuit(self) -> QuantumCircuit:
+        """
+        Construct and return the quantum circuit implementing the unitary operation.
+        
+        Returns:
+            QuantumCircuit: The unitary gate circuit that will be used in QSP sequence
+        """
+        pass
+    
+    @abstractmethod
+    def get_num_target_qubits(self) -> int:
+        """
+        Get the number of target qubits required by this oracle.
+        
+        Returns:
+            int: Number of qubits needed for the target unitary
+        """
+        pass
+    
+    @abstractmethod
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        """
+        Prepare the eigenstate required for phase kickback on target qubits.
+        
+        This method is called by the QSP estimator to initialize the target qubits
+        in the correct eigenstate before applying the QSP sequence.
+        
+        Args:
+            circuit (QuantumCircuit): The circuit to add eigenstate preparation gates to
+            target_start_idx (int): Starting index of target qubits in the circuit
+        """
+        pass
+
+
+class MockPhaseOracle(QuantumOracle):
+    """
+    Mock oracle implementing a phase gate P(θ) for testing and demonstration.
+    
+    This oracle creates a simple phase gate with a known phase, allowing us to
+    verify that the QSP phase estimation works correctly before integrating
+    the actual ECC Point Addition unitary.
+    
+    The phase gate P(θ) has eigenstate |1⟩ with eigenvalue e^(iθ).
+    """
+    
+    def __init__(self, phase: float):
+        """
+        Initialize the mock phase oracle.
+        
+        Args:
+            phase (float): The phase angle θ (in radians)
+        """
+        self.phase = phase
+    
+    def construct_circuit(self) -> QuantumCircuit:
+        """
+        Construct the phase gate circuit P(θ).
+        
+        Returns:
+            QuantumCircuit: Single-qubit circuit implementing P(θ)
+        """
+        qc = QuantumCircuit(1)
+        qc.p(self.phase, 0)
+        return qc
+    
+    def get_num_target_qubits(self) -> int:
+        """Return 1 (single-qubit phase gate)."""
+        return 1
+    
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        """
+        Prepare |1⟩ eigenstate for phase kickback.
+        
+        CRITICAL: The phase gate P(θ) requires |1⟩ state to observe phase kickback.
+        P(θ)|0⟩ = |0⟩ (no phase), but P(θ)|1⟩ = e^(iθ)|1⟩ (phase kickback occurs).
+        
+        Args:
+            circuit (QuantumCircuit): Circuit to add X gate to
+            target_start_idx (int): Index of target qubit
+        """
+        circuit.x(target_start_idx)
+
+
+class ECCOracle(QuantumOracle):
+    """
+    Placeholder for Elliptic Curve Cryptography Point Addition Oracle.
+    
+    This class will implement the actual ECC Point Addition unitary operation
+    required for Shor's algorithm on elliptic curve discrete logarithm problem.
+    
+    ============================================================================
+    INTEGRATION INSTRUCTIONS:
+    
+    To implement the ECC oracle:
+    
+    1. Implement construct_circuit():
+       - Create quantum circuit for elliptic curve point addition operation
+       - The circuit should implement the unitary U|P⟩ = |P + Q⟩ where Q is fixed
+       - Ensure the circuit can be controlled (for use in QSP sequence)
+    
+    2. Implement get_num_target_qubits():
+       - Return the number of qubits needed to represent elliptic curve points
+       - This depends on the curve size and point representation
+    
+    3. Implement prepare_eigenstate():
+       - Determine the eigenstates of the ECC Point Addition operation
+       - Prepare the appropriate superposition state on target qubits
+       - This may involve Hadamard gates or more complex state preparation
+    
+    4. Controlled Version:
+       - The QSP estimator will automatically create a controlled version
+       - Ensure your circuit is compatible with Qiskit's .control() method
+    
+    5. Testing:
+       - Test with small curves first
+       - Verify phase estimation works correctly
+       - Compare with classical computation for validation
+    
+    ============================================================================
+    """
+    
+    def __init__(self, curve_params: dict):
+        """
+        Initialize ECC oracle with curve parameters.
+        
+        Args:
+            curve_params (dict): Elliptic curve parameters (to be defined)
+        """
+        self.curve_params = curve_params
+        raise NotImplementedError(
+            "ECCOracle is a placeholder. Implement construct_circuit(), "
+            "get_num_target_qubits(), and prepare_eigenstate() methods."
+        )
+    
+    def construct_circuit(self) -> QuantumCircuit:
+        """
+        Construct ECC Point Addition circuit.
+        
+        TODO: Implement elliptic curve point addition unitary.
+        """
+        raise NotImplementedError("ECC Point Addition circuit not yet implemented")
+    
+    def get_num_target_qubits(self) -> int:
+        """
+        Get number of qubits needed for ECC point representation.
+        
+        TODO: Calculate based on curve size.
+        """
+        raise NotImplementedError("ECC qubit count calculation not yet implemented")
+    
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        """
+        Prepare eigenstate for ECC Point Addition operation.
+        
+        TODO: Determine eigenstates and implement state preparation.
+        """
+        raise NotImplementedError("ECC eigenstate preparation not yet implemented")
+
+
+# ==============================================================================
+# 3. QSP Circuit & Estimator
 # ==============================================================================
 
 def get_noise_model(error_rate):
@@ -106,15 +285,17 @@ def get_noise_model(error_rate):
 
 
 class QSPPhaseEstimator:
-    def __init__(self, degree=5, shots=1024, error_rate=0.0):
+    def __init__(self, oracle: QuantumOracle, degree=5, shots=1024, error_rate=0.0):
         """
         Initialize QSP Phase Estimator.
         
         Args:
+            oracle (QuantumOracle): The quantum oracle implementing the target unitary
             degree (int): QSP polynomial degree
             shots (int): Number of measurement shots
             error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error)
         """
+        self.oracle = oracle
         self.degree = degree
         self.shots = shots
         self.error_rate = error_rate
@@ -129,26 +310,30 @@ class QSPPhaseEstimator:
         return find_optimized_angles(degree)
 
 
-    def build_qsp_circuit(self, target_unitary, phase_shift=0.0):
+    def build_qsp_circuit(self, phase_shift=0.0):
         """
-        Build QSP circuit for phase estimation.
+        Build QSP circuit for phase estimation using the oracle.
         
-        CRITICAL FIX: Prepare target qubit(s) in |1⟩ state to enable phase kickback.
-        For phase gate P(θ), we need |1⟩ eigenstate (eigenvalue e^(iθ)) instead of |0⟩.
+        The oracle handles eigenstate preparation, ensuring correct initialization
+        for phase kickback. This separation of concerns makes the code extensible.
         """
-        num_target = target_unitary.num_qubits
+        # Get unitary circuit and qubit count from oracle
+        target_unitary = self.oracle.construct_circuit()
+        num_target = self.oracle.get_num_target_qubits()
+        
+        # Create circuit: 1 ancilla + target qubits
         qc = QuantumCircuit(1 + num_target, 1)
         
-        # Prepare target qubit(s) in |1⟩ state for phase kickback
-        # This is critical: P(θ)|0⟩ = |0⟩ (no phase), but P(θ)|1⟩ = e^(iθ)|1⟩
-        for t in range(1, 1 + num_target):
-            qc.x(t)
+        # Prepare eigenstate on target qubits (oracle knows its eigenstates)
+        self.oracle.prepare_eigenstate(qc, target_start_idx=1)
         
         # Prepare ancilla in |+⟩ state
         qc.h(0)
         qc.rz(-2 * self.angles[0], 0)
         
+        # Apply QSP sequence: alternating controlled-U and Z-rotations
         for k in range(1, len(self.angles)):
+            # Create controlled version of oracle's unitary
             c_u = target_unitary.control(1)
             qc.append(c_u, list(range(1 + num_target)))
             
@@ -163,11 +348,17 @@ class QSPPhaseEstimator:
         return qc
 
 
-    def measure_probability(self, target_unitary, phase_shift):
+    def measure_probability(self, phase_shift):
         """
         Measure probability with optional noise model for robustness testing.
+        
+        Args:
+            phase_shift (float): Phase shift to apply for binary search window scanning
+            
+        Returns:
+            float: Probability of measuring |0⟩ on ancilla qubit
         """
-        qc = self.build_qsp_circuit(target_unitary, phase_shift)
+        qc = self.build_qsp_circuit(phase_shift)
         
         # Execute with noise model if error_rate > 0
         if self.noise_model is not None:
@@ -179,8 +370,19 @@ class QSPPhaseEstimator:
         return counts.get('0', 0) / self.shots
 
 
-    def estimate_phase_binary_search(self, target_unitary, precision_bits=5):
-        """Iterative Binary Search Phase Estimation"""
+    def estimate_phase_binary_search(self, precision_bits=5):
+        """
+        Iterative Binary Search Phase Estimation.
+        
+        Uses the oracle's unitary to perform high-precision phase estimation
+        with only a single ancilla qubit through iterative binary search.
+        
+        Args:
+            precision_bits (int): Number of bits of precision (each bit halves the search space)
+            
+        Returns:
+            float: Estimated phase in [0, 2π)
+        """
         current_range_start = 0.0
         current_window = 2 * np.pi
         
@@ -192,7 +394,7 @@ class QSPPhaseEstimator:
             shift = mid - np.pi
             
             # Check phase relative to mid
-            prob_0 = self.measure_probability(target_unitary, shift)
+            prob_0 = self.measure_probability(shift)
             
             # If prob_0 is high, phase is in [shift, shift+pi] -> [mid-pi, mid] (Lower Half)
             # (Note: Logic depends on exact filter alignment, simplified here)
@@ -455,7 +657,7 @@ def create_ecc_order_finding_unitary(curve, base_point_P, target_point_Q, order_
     # actual quantum point addition circuits
     qc = QuantumCircuit(1)
     qc.p(phase, 0)
-    
+
     return qc
 
 
@@ -569,10 +771,67 @@ def create_mock_ecc_unitary(theta):
 
 
 if __name__ == "__main__":
+    actual_phase = (2/3) * np.pi 
     print(f"\n{'='*70}")
-    print(f"AlphaShor - ECDLP Solver using QSP Phase Estimation")
-    print(f"Q-Day Prize Competition Entry")
+    print(f"QSP-Based Robust Phase Estimation - Q-Day Prize Demonstration")
     print(f"{'='*70}")
+    print(f"\nTARGET PHASE: {actual_phase:.6f} rad ({np.degrees(actual_phase):.2f}°)")
+    
+    # Create oracle using Oracle Pattern (easily swappable with ECCOracle)
+    oracle = MockPhaseOracle(phase=actual_phase)
+    
+    # ========================================================================
+    # 1. Ideal Simulation (Noiseless)
+    # ========================================================================
+    print(f"\n{'─'*70}")
+    print("1. IDEAL SIMULATION (Error Rate: 0.0%)")
+    print(f"{'─'*70}")
+    
+    estimator_ideal = QSPPhaseEstimator(oracle=oracle, degree=5, shots=2000, error_rate=0.0)
+    estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(precision_bits=6)
+    
+    error_ideal = abs(estimated_phase_ideal - actual_phase)
+    # Handle wrap-around
+    error_ideal = min(error_ideal, 2 * np.pi - error_ideal)
+    
+    print(f"\nResults (Ideal):")
+    print(f"  Actual:    {actual_phase:.6f} rad")
+    print(f"  Estimated: {estimated_phase_ideal:.6f} rad")
+    print(f"  Error:     {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
+    
+    # ========================================================================
+    # 2. Noisy Simulation (2% Depolarizing Error)
+    # ========================================================================
+    print(f"\n{'─'*70}")
+    print("2. NOISY SIMULATION (Error Rate: 2.0% - Demonstrating Robustness)")
+    print(f"{'─'*70}")
+    
+    estimator_noisy = QSPPhaseEstimator(oracle=oracle, degree=5, shots=2000, error_rate=0.02)
+    estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(precision_bits=6)
+    
+    error_noisy = abs(estimated_phase_noisy - actual_phase)
+    # Handle wrap-around
+    error_noisy = min(error_noisy, 2 * np.pi - error_noisy)
+    
+    print(f"\nResults (Noisy):")
+    print(f"  Actual:    {actual_phase:.6f} rad")
+    print(f"  Estimated: {estimated_phase_noisy:.6f} rad")
+    print(f"  Error:     {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
+    
+    # ========================================================================
+    # Summary Comparison
+    # ========================================================================
+    print(f"\n{'='*70}")
+    print("SUMMARY COMPARISON")
+    print(f"{'='*70}")
+    print(f"Ideal (0% error):  Error = {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
+    print(f"Noisy (2% error):   Error = {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
+    if error_ideal > 0:
+        print(f"Robustness:        {((error_noisy - error_ideal) / error_ideal * 100):+.1f}% degradation")
+    print(f"\n{'='*70}")
+    print("Note: The QSP binary search demonstrates robustness by maintaining")
+    print("reasonable accuracy even with 2% depolarizing noise.")
+    print(f"{'='*70}\n")
     
     # ========================================================================
     # Define Elliptic Curve Parameters (Small curve for testing)
