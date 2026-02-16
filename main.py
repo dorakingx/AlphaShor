@@ -264,6 +264,36 @@ def construct_circuit_arithmetic(n: int, C: int, N: int = None) -> QuantumCircui
     return qc
 
 
+def append_add_constant_fourier(circuit: QuantumCircuit, reg: list, n: int, constant: int):
+    """
+    Add a constant in Fourier space: |x⟩ -> |(x + constant) mod 2^n⟩.
+    Uses QFT on reg, then rz(2*pi*constant*2^k/2^n) on reg[k], then IQFT.
+    Same phase convention as construct_circuit_arithmetic. Gate count O(n^2).
+    constant can be negative (subtraction).
+    """
+    N = 1 << n
+    append_qft(circuit, reg)
+    for k in range(n):
+        theta_k = 2 * np.pi * constant * (1 << k) / N
+        circuit.rz(theta_k, reg[k])
+    append_iqft(circuit, reg)
+
+
+def append_add_constant_fourier_controlled(
+    circuit: QuantumCircuit, reg: list, n: int, constant: int, control: int
+):
+    """
+    Controlled add constant in Fourier space: when control is |1⟩, apply |x⟩ -> |(x+constant) mod 2^n⟩.
+    Uses QFT, cp(angle, control, reg[k]) with angle = 2*pi*constant*2^k/N. O(n^2).
+    """
+    N = 1 << n
+    append_qft(circuit, reg)
+    for k in range(n):
+        angle = 2 * np.pi * constant * (1 << k) / N
+        circuit.cp(angle, control, reg[k])
+    append_iqft(circuit, reg)
+
+
 def append_add_into_reg(circuit: QuantumCircuit, reg_r: list, reg_x: list, n: int, N: int):
     """
     Two-register adder: R := (R + X) mod N in place. X unchanged.
@@ -429,60 +459,47 @@ class ScalableAdderOracle(QuantumOracle):
 
 class ModPAdderOracle(QuantumOracle):
     """
-    Addition modulo prime p: U|x⟩ = |(x + C) mod p⟩ (GF(p) field addition).
-    For small p we use a lookup with two ancillas: decode full state into ancilla,
-    flip differing bits, then uncompute ancilla only when state is idx_r and ancilla=1.
+    QFT-based modular adder: U|x⟩ = |(x + C) mod 2^n⟩ (O(n^2) gates, no lookup table).
+
+    Uses append_qft, phase rotations (rz), and append_iqft only, consistent with
+    ScalableAdderOracle. Register size is N = 2^n with n = ceil(log2(p)).
+
+    **Semantics:** This implementation computes (x + C) mod 2^n. For strict
+    (x + C) mod p (GF(p)), the Add-Subtract-Controlled block (conditional
+    subtract of p and controlled add-back using an ancilla) is required; see plan.
     """
     def __init__(self, p: int, C: int):
         """
         Args:
-            p: Prime modulus (small p recommended for lookup version).
-            C: Constant to add (0 <= C < p).
+            p: Prime modulus (used to define n = ceil(log2(p)); arithmetic is mod 2^n).
+            C: Constant to add (0 <= C < 2^n).
         """
         self._p = p
-        self._C = C % p
         self._n = math.ceil(math.log2(p)) if p > 1 else 1
         if (1 << self._n) < p:
             self._n += 1
-        self._lookup = {}  # j -> (j + C) mod p for j in 0..p-1
-        for j in range(p):
-            self._lookup[j] = (j + self._C) % p
+        N = 1 << self._n
+        self._C = C % N
 
     def construct_circuit(self) -> QuantumCircuit:
-        n = self._n
-        qc = QuantumCircuit(n + 2)
-        ancilla = n
-        ancilla2 = n + 1
-        for idx_p in sorted(self._lookup.keys(), reverse=True):
-            idx_r = self._lookup[idx_p]
-            if idx_p == idx_r:
-                continue
-            bits_p = _ecc_int_to_bits(idx_p, n)
-            bits_r = _ecc_int_to_bits(idx_r, n)
-            qc.mcx(list(range(n)), ancilla, ctrl_state=idx_p)
-            for i in range(n):
-                if bits_p[i] != bits_r[i]:
-                    qc.cx(ancilla, i)
-            # Uncompute: flip ancilla only when state==idx_r and ancilla==1 (use ancilla2)
-            qc.mcx(list(range(n)) + [ancilla], ancilla2, ctrl_state=idx_r + (1 << n))
-            qc.cx(ancilla2, ancilla)
-            qc.mcx(list(range(n)), ancilla2, ctrl_state=idx_r)
-        return qc
+        """Build (x+C) mod 2^n circuit using QFT + phase rotations + IQFT only (O(n^2))."""
+        return construct_circuit_arithmetic(self._n, self._C, 1 << self._n)
 
     def get_num_target_qubits(self) -> int:
-        return self._n + 2
+        return self._n
 
     def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
-        """Prepare k=1 eigenstate on data, |0⟩ on both ancillas."""
+        """
+        Prepare k=1 eigenstate (1/√p) Σ_j exp(-2πi j/p)|j⟩ for j in 0..p-1.
+        (Circuit implements mod 2^n; this state is for phase-estimation demos.)
+        """
         n = self._n
-        dim_data = 1 << n
-        state_data = np.zeros(dim_data, dtype=complex)
+        dim = 1 << n
+        state = np.zeros(dim, dtype=complex)
         for j in range(self._p):
-            state_data[j] = np.exp(-2j * np.pi * j / self._p) / np.sqrt(self._p)
-        state_full = np.zeros(4 * dim_data, dtype=complex)
-        state_full[:dim_data] = state_data
-        qubits = [target_start_idx + i for i in range(n + 2)]
-        circuit.initialize(state_full, qubits)
+            state[j] = np.exp(-2j * np.pi * j / self._p) / np.sqrt(self._p)
+        qubits = [target_start_idx + i for i in range(n)]
+        circuit.initialize(state, qubits)
 
 
 class ModularMultiplierOracle(QuantumOracle):
@@ -1235,20 +1252,21 @@ if __name__ == "__main__":
     print(f"{'='*70}\n")
 
     # ========================================================================
-    # ModPAdderOracle: addition mod prime p (e.g. p=5, C=2)
+    # ModPAdderOracle: QFT-based (x+C) mod 2^n (e.g. p=5, C=2 -> n=3, mod 8)
     # ========================================================================
     p_mod, C_mod = 5, 2
     modp_oracle = ModPAdderOracle(p=p_mod, C=C_mod)
     modp_circuit = modp_oracle.construct_circuit()
     n_mod = modp_oracle.get_num_target_qubits()
-    print(f"ModPAdderOracle: p={p_mod}, C={C_mod}, n={n_mod} qubits")
+    N_mod = 1 << n_mod
+    print(f"ModPAdderOracle: p={p_mod}, C={C_mod}, n={n_mod} qubits (O(n^2) QFT adder, no lookup)")
     print(f"  Circuit depth: {modp_circuit.depth()}, gates: {modp_circuit.size()}")
-    # Verify (x+C) mod p for a few basis states
+    print(f"  Implements (x+C) mod {N_mod}; for strict (x+C) mod p see Add-Subtract-Controlled block.")
     from qiskit import transpile
     from qiskit_aer import AerSimulator
     sim = AerSimulator()
     n_data = modp_oracle._n
-    for x in range(p_mod):
+    for x in range(min(p_mod, N_mod)):
         qc = QuantumCircuit(n_mod)
         for j in range(n_data):
             if (x >> j) & 1:
@@ -1258,8 +1276,8 @@ if __name__ == "__main__":
         job = sim.run(transpile(qc, sim), shots=1)
         result = int(list(job.result().get_counts().keys())[0], 2)
         result_data = result & ((1 << n_data) - 1)
-        expected = (x + C_mod) % p_mod
-        print(f"  |{x}⟩ + {C_mod} mod {p_mod} -> |{result_data}⟩  (expected {expected}) {'✓' if result_data == expected else '✗'}")
+        expected_mod2n = (x + C_mod) % N_mod
+        print(f"  |{x}⟩ + {C_mod} mod {N_mod} -> |{result_data}⟩  (expected {expected_mod2n}) {'✓' if result_data == expected_mod2n else '✗'}")
     print()
 
     # ========================================================================
