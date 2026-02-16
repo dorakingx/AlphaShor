@@ -215,6 +215,54 @@ def _ecc_bits_to_int(bits: list) -> int:
     return sum(int(b) << i for i, b in enumerate(bits))
 
 
+# ==============================================================================
+# Quantum Arithmetic: QFT and Draper Adder
+# ==============================================================================
+
+def append_qft(circuit: QuantumCircuit, qubits: list):
+    """
+    Append in-place QFT to circuit on the given qubits.
+    qubits[0] is LSB (consistent with j = sum_i bit_i * 2^i).
+    For each i: H(qubits[i]); then for each j > i: CP(2*pi/2^(j-i+1)) control=qubits[j], target=qubits[i].
+    """
+    n = len(qubits)
+    for i in range(n):
+        circuit.h(qubits[i])
+        for j in range(i + 1, n):
+            angle = 2 * np.pi / (1 << (j - i + 1))
+            circuit.cp(angle, qubits[j], qubits[i])
+
+
+def append_iqft(circuit: QuantumCircuit, qubits: list):
+    """
+    Append inverse QFT (reverse gate order, negate angles).
+    """
+    n = len(qubits)
+    for i in range(n - 1, -1, -1):
+        for j in range(n - 1, i, -1):
+            angle = -2 * np.pi / (1 << (j - i + 1))
+            circuit.cp(angle, qubits[j], qubits[i])
+        circuit.h(qubits[i])
+
+
+def construct_circuit_arithmetic(n: int, C: int, N: int = None) -> QuantumCircuit:
+    """
+    Draper-style modular adder: |x⟩ -> |(x + C) mod N⟩.
+    Uses QFT, phase rotations to add C in Fourier space, then IQFT.
+    N must be 2^n (power of 2); if N is None, N = 2^n.
+    Gate count O(n^2).
+    """
+    if N is None:
+        N = 1 << n
+    qc = QuantumCircuit(n)
+    append_qft(qc, list(range(n)))
+    for k in range(n):
+        theta_k = 2 * np.pi * C * (1 << k) / N
+        qc.rz(theta_k, k)
+    append_iqft(qc, list(range(n)))
+    return qc
+
+
 class ECCOracle(QuantumOracle):
     """
     Elliptic Curve Point Addition Oracle: U|P⟩ = |P + Q⟩.
@@ -316,6 +364,38 @@ class ECCOracle(QuantumOracle):
             state[idx] = np.exp(1j * phase) / np.sqrt(r)
         qubits = [target_start_idx + i for i in range(self.num_qubits)]
         circuit.initialize(state, qubits)
+
+
+class ScalableAdderOracle(QuantumOracle):
+    """
+    Oracle implementing U|x⟩ = |(x + C) mod N⟩ using quantum arithmetic only
+    (QFT + phase rotations + IQFT). No lookup table; gate count O(n^2).
+    """
+    def __init__(self, N: int, C: int):
+        """
+        Args:
+            N: Modulus (must be power of 2, e.g. 8, 16).
+            C: Constant to add (0 <= C < N).
+        """
+        self._N = N
+        self._C = C % N
+        self._n = (N - 1).bit_length() if N > 0 else 0
+        if N != (1 << self._n):
+            raise ValueError("N must be a power of 2")
+    
+    def construct_circuit(self) -> QuantumCircuit:
+        return construct_circuit_arithmetic(self._n, self._C, self._N)
+    
+    def get_num_target_qubits(self) -> int:
+        return self._n
+    
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        """
+        Prepare k=1 eigenstate |ψ_1⟩ = (1/√N) Σ_j exp(-2πi j/N)|j⟩ via IQFT|1⟩.
+        """
+        qubits = list(range(target_start_idx, target_start_idx + self._n))
+        circuit.x(qubits[0])  # |0..01⟩
+        append_iqft(circuit, qubits)
 
 
 # ==============================================================================
@@ -990,3 +1070,30 @@ if __name__ == "__main__":
     print(f"\nIdeal (0% error):  Phase error = {error_ideal:.6f} rad")
     print(f"Noisy (2% error):  Phase error = {error_noisy:.6f} rad")
     print(f"\n{'='*70}\n")
+
+    # ========================================================================
+    # ScalableAdderOracle: Quantum arithmetic (Draper adder, O(n^2) gates)
+    # ========================================================================
+    N_adder = 8
+    C_adder = 3
+    scalable_oracle = ScalableAdderOracle(N=N_adder, C=C_adder)
+    add_circuit = scalable_oracle.construct_circuit()
+    print(f"ScalableAdderOracle: N={N_adder}, C={C_adder}, n={scalable_oracle.get_num_target_qubits()} qubits")
+    print(f"  Circuit depth: {add_circuit.depth()}, gates: {add_circuit.size()} (O(n^2) scaling)")
+    expected_phase_adder = 2 * np.pi * C_adder / N_adder
+    print(f"  Expected phase (eigenstate k=1): 2π C/N = {expected_phase_adder:.6f} rad ({np.degrees(expected_phase_adder):.2f}°)")
+
+    print(f"\n{'─'*70}")
+    print("ScalableAdderOracle - IDEAL SIMULATION")
+    print(f"{'─'*70}")
+    est_adder = QSPPhaseEstimator(oracle=scalable_oracle, degree=5, shots=2000, error_rate=0.0)
+    estimated_phase_adder = est_adder.estimate_phase_binary_search(precision_bits=6)
+    estimated_phase_adder = estimated_phase_adder % (2 * np.pi)
+    error_adder = abs(estimated_phase_adder - expected_phase_adder)
+    error_adder = min(error_adder, 2 * np.pi - error_adder)
+    print(f"\n  Expected:  {expected_phase_adder:.6f} rad")
+    print(f"  Estimated: {estimated_phase_adder:.6f} rad")
+    print(f"  Error:     {error_adder:.6f} rad")
+    print(f"\n{'='*70}")
+    print("ScalableAdderOracle uses quantum arithmetic (QFT+phases+IQFT), not lookup table.")
+    print(f"{'='*70}\n")
