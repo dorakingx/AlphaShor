@@ -18,8 +18,10 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_aer import Aer
 from qiskit.visualization import plot_histogram
 from qiskit_aer.noise import NoiseModel, depolarizing_error
+import json
 import math
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -735,6 +737,82 @@ class QSPPhaseEstimator:
 # 3. Elliptic Curve Cryptography Implementation
 # ==============================================================================
 
+def _normalize_qday_bit_length(bit_length):
+    """Accept int (e.g. 4) or str ('4-bit', '4')."""
+    if isinstance(bit_length, int):
+        return bit_length
+    s = str(bit_length).strip().lower().replace("-bit", "").strip()
+    return int(s)
+
+
+def load_qday_curves(json_path=None, bit_length=4):
+    """
+    Load Q-Day Prize curve parameters from curves.json (official competition format).
+
+    Curves are generated for y^2 = x^3 + 7 over F_p (a=0, b=7); see curves/curves.py.
+
+    Args:
+        json_path: Path to JSON file; default is curves/curves.json next to this module.
+        bit_length: Prime bit size to select (int or '4-bit' style). Smallest in JSON is 4.
+
+    Returns:
+        dict with keys: p, a, b, G, public_key, private_key, subgroup_order, curve_order,
+        cofactor, bit_length.
+    """
+    if json_path is None:
+        json_path = Path(__file__).resolve().parent / "curves" / "curves.json"
+    else:
+        json_path = Path(json_path)
+    if not json_path.is_file():
+        raise FileNotFoundError(f"Q-Day curves file not found: {json_path}")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {json_path}: {e}") from e
+    if not isinstance(data, list):
+        raise ValueError(f"Expected a JSON array in {json_path}")
+
+    n = _normalize_qday_bit_length(bit_length)
+    entry = None
+    for item in data:
+        if isinstance(item, dict) and item.get("bit_length") == n:
+            entry = item
+            break
+    if entry is None:
+        available = sorted(
+            {x["bit_length"] for x in data if isinstance(x, dict) and "bit_length" in x}
+        )
+        if n == 3:
+            raise ValueError(
+                f"No curve with bit_length={n} in {json_path}. "
+                "3-bit curves are not present in the official Q-Day dataset; "
+                f"use bit_length=4 (smallest available) or another size. "
+                f"Available: {available}."
+            )
+        raise ValueError(
+            f"No curve with bit_length={n} in {json_path}. Available bit lengths: {available}."
+        )
+
+    p = int(entry["prime"])
+    a, b = 0, 7
+    G = (int(entry["generator_point"][0]), int(entry["generator_point"][1]))
+    public_key = (int(entry["public_key"][0]), int(entry["public_key"][1]))
+    private_key = int(entry["private_key"])
+    return {
+        "p": p,
+        "a": a,
+        "b": b,
+        "G": G,
+        "public_key": public_key,
+        "private_key": private_key,
+        "subgroup_order": int(entry["subgroup_order"]),
+        "curve_order": int(entry["curve_order"]),
+        "cofactor": int(entry["cofactor"]),
+        "bit_length": int(entry["bit_length"]),
+    }
+
+
 class EllipticCurve:
     """
     Elliptic Curve over finite field GF(p): y^2 = x^3 + ax + b (mod p)
@@ -1155,31 +1233,46 @@ if __name__ == "__main__":
     
     # ========================================================================
     # ECC Demo: ECCOracle (quantum point addition U|P⟩ = |P+Q⟩)
+    # Q-Day Prize official curves from curves/curves.json (y² = x³ + 7)
+    # Smallest entry is 4-bit; 3-bit curves are not in the official dataset.
     # ========================================================================
-    # Curve y² = x³ + x + 1 mod 5 (small curve for demo)
-    p = 5
-    a = 1
-    b = 1
-    print(f"\nElliptic Curve (ECC Oracle demo): y² = x³ + {a}x + {b} (mod {p})")
-    
+    QDAY_CURVE_BITS = 4  # or "4-bit"; use load_qday_curves(..., bit_length=6) etc.
+    qday = load_qday_curves(bit_length=QDAY_CURVE_BITS)
+    p = qday["p"]
+    a, b = qday["a"], qday["b"]
+    G = qday["G"]
+    target_point_Q = qday["public_key"]
+    json_private_key = qday["private_key"]
+    order_r = qday["subgroup_order"]
+
+    print(f"\nQ-Day curve ({qday['bit_length']}-bit prime): y² = x³ + {b} (mod {p}), a={a}")
+    print(f"  subgroup_order (JSON): {order_r}, cofactor: {qday['cofactor']}")
+
     curve = EllipticCurve(p, a, b)
-    all_points = curve.get_all_points()
-    print(f"All points on curve: {len(all_points)} (including point at infinity)")
-    
-    # Generator Q for point addition (fixed point added by oracle)
-    base_point_P = (0, 1) if (0, 1) in all_points else (all_points[1] if len(all_points) > 1 else None)
-    if base_point_P is None:
-        print("Error: Could not find a base point!")
+    if not curve.is_point_on_curve(G):
+        print("Error: generator G from JSON is not on the curve!")
         exit(1)
-    order_r = curve.find_point_order(base_point_P)
-    print(f"Generator Q (fixed point to add): {base_point_P}")
-    print(f"Order of Q: r = {order_r}")
-    
-    # ECCOracle: U|P⟩ = |P+Q⟩. No secret k used in circuit.
+    order_check = curve.find_point_order(G)
+    if order_check != order_r:
+        print(
+            f"Warning: find_point_order(G)={order_check} != subgroup_order from JSON ({order_r})."
+        )
+    key_ok = curve.scalar_multiply(json_private_key, G) == target_point_Q
+    print(f"Classical key check (d·G == Q_pub): {'PASS' if key_ok else 'FAIL'}")
+    print(f"  Generator G: {G}, public key Q: {target_point_Q}")
+    print(
+        "  JSON private_key d is for dataset validation only; this QSP demo recovers "
+        "subgroup order r from phase, not the discrete log d via quantum measurement."
+    )
+
+    # ECCOracle: U|P⟩ = |P+G⟩ (fixed generator G from competition data).
     curve_params = {
-        "p": p, "a": a, "b": b,
-        "Q": base_point_P,
+        "p": p,
+        "a": a,
+        "b": b,
+        "Q": G,
         "curve": curve,
+        "target_public_key": target_point_Q,
     }
     ecc_oracle = ECCOracle(curve_params)
     print(f"ECCOracle: {ecc_oracle.get_num_target_qubits()} target qubits, subgroup order {len(ecc_oracle._subgroup_points)}")
@@ -1218,9 +1311,12 @@ if __name__ == "__main__":
             recovered_r = r_cand
     if recovered_r is not None:
         print(f"\n✓ Recovered order: r = {recovered_r}")
+        match_json = recovered_r == qday["subgroup_order"]
+        print(f"  Matches JSON subgroup_order ({qday['subgroup_order']}): {'yes' if match_json else 'no'}")
     else:
         recovered_r = order_r  # use known for summary
-    
+        print(f"\n(Phase CF did not isolate r; JSON subgroup_order = {qday['subgroup_order']})")
+
     # ========================================================================
     # ECC Oracle - Noisy Simulation
     # ========================================================================
@@ -1246,8 +1342,8 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print("ECC ORACLE SUMMARY")
     print(f"{'='*70}")
-    print(f"Curve: y² = x³ + {a}x + {b} (mod {p})")
-    print(f"Generator Q: {base_point_P}, order r: {order_r}")
+    print(f"Curve: y² = x³ + {b} (mod {p}), a={a}")
+    print(f"Generator G (oracle fixed point): {G}, subgroup order r: {order_r}")
     print(f"ECCOracle: U|P⟩ = |P+Q⟩ (lookup-table, no classical cheating)")
     print(f"\nIdeal (0% error):  Phase error = {error_ideal:.6f} rad")
     print(f"Noisy (2% error):  Phase error = {error_noisy:.6f} rad")

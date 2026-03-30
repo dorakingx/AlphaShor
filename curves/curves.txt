@@ -1,0 +1,186 @@
+Q Day Curves
+Seed for reproducibility: 536
+========================================
+
+
+--- Bit size 1 ---
+No candidate primes found for bit size 1.
+
+--- Bit size 2 ---
+No candidate primes found for bit size 2.
+
+--- Bit size 3 ---
+No candidate primes found for bit size 3.
+
+--- Bit size 4 ---
+Bit size: 4
+Prime p: 13
+Curve order (#E): 7
+Subgroup order n: 7
+Cofactor h: 1
+Generator point G: (11, 5)
+Private key d: 6
+Public key Q: (11, 8)
+
+--- Bit size 5 ---
+No valid curve found for bit size 5.
+
+--- Bit size 6 ---
+Bit size: 6
+Prime p: 43
+Curve order (#E): 31
+Subgroup order n: 31
+Cofactor h: 1
+Generator point G: (34, 3)
+Private key d: 18
+Public key Q: (21, 25)
+
+--- Bit size 7 ---
+Bit size: 7
+Prime p: 67
+Curve order (#E): 79
+Subgroup order n: 79
+Cofactor h: 1
+Generator point G: (48, 60)
+Private key d: 56
+Public key Q: (52, 7)
+
+--- Bit size 8 ---
+Bit size: 8
+Prime p: 163
+Curve order (#E): 139
+Subgroup order n: 139
+Cofactor h: 1
+Generator point G: (112, 53)
+Private key d: 103
+Public key Q: (122, 144)
+
+--- Bit size 9 ---
+Bit size: 9
+Prime p: 349
+Curve order (#E): 313
+Subgroup order n: 313
+Cofactor h: 1
+Generator point G: (22, 191)
+Private key d: 135
+Public key Q: (138, 315)
+
+--- Bit size 10 ---
+Bit size: 10
+Prime p: 547
+Curve order (#E): 547
+Subgroup order n: 547
+Cofactor h: 1
+Generator point G: (386, 359)
+Private key d: 165
+Public key Q: (286, 462)
+
+--- Bit size 11 ---
+Bit size: 11
+Prime p: 1051
+Curve order (#E): 1093
+Subgroup order n: 1093
+Cofactor h: 1
+Generator point G: (471, 914)
+Private key d: 756
+Public key Q: (179, 86)
+
+--- Bit size 12 ---
+Bit size: 12
+Prime p: 2089
+Curve order (#E): 2143
+Subgroup order n: 2143
+Cofactor h: 1
+Generator point G: (1417, 50)
+Private key d: 1384
+Public key Q: (1043, 1795)
+
+--- Bit size 13 ---
+Bit size: 13
+Prime p: 4159
+Curve order (#E): 4243
+Subgroup order n: 4243
+Cofactor h: 1
+Generator point G: (3390, 2980)
+Private key d: 820
+Public key Q: (3457, 3962)
+
+--- Bit size 14 ---
+Bit size: 14
+Prime p: 8209
+Curve order (#E): 8293
+Subgroup order n: 8293
+Cofactor h: 1
+Generator point G: (5566, 7)
+Private key d: 137
+Public key Q: (2144, 2381)
+
+--- Bit size 15 ---
+Bit size: 15
+Prime p: 16477
+Curve order (#E): 16693
+Subgroup order n: 16693
+Cofactor h: 1
+Generator point G: (15429, 10667)
+Private key d: 14794
+Public key Q: (6884, 12671)
+
+--- Bit size 16 ---
+Bit size: 16
+Prime p: 32803
+Curve order (#E): 32497
+Subgroup order n: 32497
+Cofactor h: 1
+Generator point G: (14333, 24084)
+Private key d: 20248
+Public key Q: (31890, 7753)
+
+--- Bit size 17 ---
+Bit size: 17
+Prime p: 65647
+Curve order (#E): 65173
+Subgroup order n: 65173
+Cofactor h: 1
+Generator point G: (12976, 52834)
+Private key d: 1441
+Public key Q: (477, 58220)
+
+--- Bit size 18 ---
+Bit size: 18
+Prime p: 131251
+Curve order (#E): 130579
+Subgroup order n: 130579
+Cofactor h: 1
+Generator point G: (66566, 127721)
+Private key d: 26320
+Public key Q: (122895, 58382)
+
+--- Bit size 19 ---
+Bit size: 19
+Prime p: 262153
+Curve order (#E): 262567
+Subgroup order n: 262567
+Cofactor h: 1
+Generator point G: (44507, 141754)
+Private key d: 36124
+Public key Q: (253977, 23539)
+
+--- Bit size 20 ---
+Bit size: 20
+Prime p: 525043
+Curve order (#E): 524269
+Subgroup order n: 524269
+Cofactor h: 1
+Generator point G: (449655, 39077)
+Private key d: 493247
+Public key Q: (417592, 204251)
+
+--- Bit size 21 ---
+Bit size: 21
+Prime p: 1048783
+Curve order (#E): 1050337
+Subgroup order n: 1050337
+Cofactor h: 1
+Generator point G: (231634, 106125)
+Private key d: 653735
+Public key Q: (1047961, 428633)
