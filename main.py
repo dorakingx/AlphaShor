@@ -19,7 +19,10 @@ from qiskit_aer import Aer
 from qiskit.visualization import plot_histogram
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 import math
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ==============================================================================
 # 1. QSP Angle Optimization (The Math Core)
@@ -586,6 +589,7 @@ class QSPPhaseEstimator:
             shots (int): Number of measurement shots
             error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error); local Aer only
             backend_type (str): 'local' for Aer simulator (default), 'ibm' for IBM Quantum hardware
+                (requires IBM_QUANTUM_TOKEN in environment, e.g. from a .env file)
         """
         self.oracle = oracle
         self.degree = degree
@@ -593,7 +597,13 @@ class QSPPhaseEstimator:
         self.error_rate = error_rate
         self.backend_type = backend_type
         if backend_type == 'ibm':
-            service = QiskitRuntimeService()
+            token = os.getenv("IBM_QUANTUM_TOKEN")
+            if not token:
+                raise ValueError(
+                    "IBM_QUANTUM_TOKEN is not set. Create a .env file in the project directory "
+                    "with: IBM_QUANTUM_TOKEN=your_api_key_here"
+                )
+            service = QiskitRuntimeService(channel="ibm_quantum", token=token)
             self.backend = service.least_busy(operational=True, simulator=False)
             print(f"IBM Quantum hardware backend selected: {self.backend.name}")
             self.noise_model = None
@@ -668,10 +678,12 @@ class QSPPhaseEstimator:
                 job = self.backend.run(qc_t, shots=self.shots)
             counts = job.result().get_counts()
         except Exception:
-            print(
-                "Execution failed (check IBM account: "
-                "QiskitRuntimeService.save_account(channel=\"ibm_quantum\", token=...))."
-            )
+            if self.backend_type == 'ibm':
+                print(
+                    "Execution failed (check IBM_QUANTUM_TOKEN in .env and network/queue status)."
+                )
+            else:
+                print("Execution failed.")
             raise
         return counts.get('0', 0) / self.shots
 
@@ -1324,8 +1336,8 @@ if __name__ == "__main__":
     print(f"{'='*70}\n")
 
     if RUN_ON_IBM_HARDWARE:
-        # Before setting RUN_ON_IBM_HARDWARE = True, run once locally:
-        #   QiskitRuntimeService.save_account(channel="ibm_quantum", token="YOUR_API_TOKEN")
+        # Before setting RUN_ON_IBM_HARDWARE = True, create a .env file with:
+        #   IBM_QUANTUM_TOKEN=your_api_key_here
         print(f"\n{'='*70}")
         print("IBM Quantum hardware smoke test (single QSP measurement, no full binary search)")
         print(f"{'='*70}")
