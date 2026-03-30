@@ -14,6 +14,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, transpile
+from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_aer import Aer
 from qiskit.visualization import plot_histogram
 from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -575,7 +576,7 @@ def get_noise_model(error_rate):
 
 
 class QSPPhaseEstimator:
-    def __init__(self, oracle: QuantumOracle, degree=5, shots=1024, error_rate=0.0):
+    def __init__(self, oracle: QuantumOracle, degree=5, shots=1024, error_rate=0.0, backend_type='local'):
         """
         Initialize QSP Phase Estimator.
         
@@ -583,15 +584,23 @@ class QSPPhaseEstimator:
             oracle (QuantumOracle): The quantum oracle implementing the target unitary
             degree (int): QSP polynomial degree
             shots (int): Number of measurement shots
-            error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error)
+            error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error); local Aer only
+            backend_type (str): 'local' for Aer simulator (default), 'ibm' for IBM Quantum hardware
         """
         self.oracle = oracle
         self.degree = degree
         self.shots = shots
         self.error_rate = error_rate
-        self.backend = Aer.get_backend('qasm_simulator')
+        self.backend_type = backend_type
+        if backend_type == 'ibm':
+            service = QiskitRuntimeService()
+            self.backend = service.least_busy(operational=True, simulator=False)
+            print(f"IBM Quantum hardware backend selected: {self.backend.name}")
+            self.noise_model = None
+        else:
+            self.backend = Aer.get_backend('qasm_simulator')
+            self.noise_model = get_noise_model(error_rate) if error_rate > 0 else None
         self.angles = self._get_angles(degree)
-        self.noise_model = get_noise_model(error_rate) if error_rate > 0 else None
         
     def _get_angles(self, degree):
         if degree == 5:
@@ -649,15 +658,21 @@ class QSPPhaseEstimator:
             float: Probability of measuring |0⟩ on ancilla qubit
         """
         qc = self.build_qsp_circuit(phase_shift)
-        
-        # Execute with noise model if error_rate > 0
         qc_t = transpile(qc, self.backend)
-        if self.noise_model is not None:
-            job = self.backend.run(qc_t, shots=self.shots, noise_model=self.noise_model)
-        else:
-            job = self.backend.run(qc_t, shots=self.shots)
-            
-        counts = job.result().get_counts()
+        try:
+            if self.backend_type == 'ibm':
+                job = self.backend.run(qc_t, shots=self.shots)
+            elif self.noise_model is not None:
+                job = self.backend.run(qc_t, shots=self.shots, noise_model=self.noise_model)
+            else:
+                job = self.backend.run(qc_t, shots=self.shots)
+            counts = job.result().get_counts()
+        except Exception:
+            print(
+                "Execution failed (check IBM account: "
+                "QiskitRuntimeService.save_account(channel=\"ibm_quantum\", token=...))."
+            )
+            raise
         return counts.get('0', 0) / self.shots
 
 
@@ -1062,6 +1077,8 @@ def create_mock_ecc_unitary(theta):
 
 
 if __name__ == "__main__":
+    RUN_ON_IBM_HARDWARE = False
+
     actual_phase = (2/3) * np.pi 
     print(f"\n{'='*70}")
     print(f"QSP-Based Robust Phase Estimation - Q-Day Prize Demonstration")
@@ -1305,3 +1322,17 @@ if __name__ == "__main__":
         expected_r = (a_mul * x) % N_mul
         print(f"  |{x}⟩|0⟩ -> ... |{result_r}⟩  (3*{x} mod {N_mul} = {expected_r}) {'✓' if result_r == expected_r else '✗'}")
     print(f"{'='*70}\n")
+
+    if RUN_ON_IBM_HARDWARE:
+        # Before setting RUN_ON_IBM_HARDWARE = True, run once locally:
+        #   QiskitRuntimeService.save_account(channel="ibm_quantum", token="YOUR_API_TOKEN")
+        print(f"\n{'='*70}")
+        print("IBM Quantum hardware smoke test (single QSP measurement, no full binary search)")
+        print(f"{'='*70}")
+        oracle_hw = MockPhaseOracle(phase=(2 / 3) * np.pi)
+        estimator_hw = QSPPhaseEstimator(
+            oracle=oracle_hw, degree=5, shots=1024, error_rate=0.0, backend_type="ibm"
+        )
+        p0 = estimator_hw.measure_probability(0.0)
+        print(f"Prob(|0⟩) at phase_shift=0: {p0:.4f}")
+        print(f"{'='*70}\n")
