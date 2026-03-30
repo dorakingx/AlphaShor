@@ -21,6 +21,9 @@ from qiskit_aer.noise import NoiseModel, depolarizing_error
 import json
 import math
 import os
+import signal
+import time
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -1150,6 +1153,27 @@ def continued_fractions(phi, max_denom=1000):
     return candidates
 
 
+def _ecc_order_recovery_success(estimated_phase, order_r):
+    """
+    True if continued fractions (first 5 candidates) recover subgroup order r.
+    Does not recover ECDLP private key; matches existing ECC demo logic.
+    """
+    estimated_phase = float(estimated_phase % (2 * np.pi))
+    phase_normalized = estimated_phase / (2 * np.pi)
+    candidates = continued_fractions(phase_normalized, max_denom=order_r * 2)
+    for _k_cand, r_cand in candidates[:5]:
+        if r_cand == order_r:
+            return True
+    return False
+
+
+_STRESS_TIMEOUT_SEC = 300
+
+
+def _stress_alarm_handler(signum, frame):
+    raise TimeoutError("ECC stress test exceeded time limit")
+
+
 # ==============================================================================
 # 5. Main Execution
 # ==============================================================================
@@ -1168,6 +1192,7 @@ def create_mock_ecc_unitary(theta):
 
 if __name__ == "__main__":
     RUN_ON_IBM_HARDWARE = False
+    RUN_ECC_STRESS_TEST = True
 
     actual_phase = (2/3) * np.pi 
     print(f"\n{'='*70}")
@@ -1236,118 +1261,186 @@ if __name__ == "__main__":
     # Q-Day Prize official curves from curves/curves.json (y² = x³ + 7)
     # Smallest entry is 4-bit; 3-bit curves are not in the official dataset.
     # ========================================================================
-    QDAY_CURVE_BITS = 4  # or "4-bit"; use load_qday_curves(..., bit_length=6) etc.
-    qday = load_qday_curves(bit_length=QDAY_CURVE_BITS)
-    p = qday["p"]
-    a, b = qday["a"], qday["b"]
-    G = qday["G"]
-    target_point_Q = qday["public_key"]
-    json_private_key = qday["private_key"]
-    order_r = qday["subgroup_order"]
+    if RUN_ECC_STRESS_TEST:
+        print(f"\n{'='*70}")
+        print("ECC QSP + Aer STRESS TEST (error_rate=0.0, local simulator)")
+        print("Success = subgroup order r recovered from phase (not discrete log d).")
+        print(f"{'='*70}")
+        STRESS_BIT_LENGTHS = [4, 6, 7, 8, 9, 10, 11, 12]
+        stress_rows = []
+        _use_alarm = hasattr(signal, "SIGALRM")
 
-    print(f"\nQ-Day curve ({qday['bit_length']}-bit prime): y² = x³ + {b} (mod {p}), a={a}")
-    print(f"  subgroup_order (JSON): {order_r}, cofactor: {qday['cofactor']}")
+        for bits in STRESS_BIT_LENGTHS:
+            try:
+                start_iso = datetime.now().isoformat(timespec="seconds")
+                t0 = time.perf_counter()
+                print(f"\n--- Bit length {bits} | start {start_iso} ---")
 
-    curve = EllipticCurve(p, a, b)
-    if not curve.is_point_on_curve(G):
-        print("Error: generator G from JSON is not on the curve!")
-        exit(1)
-    order_check = curve.find_point_order(G)
-    if order_check != order_r:
+                qday = load_qday_curves(bit_length=bits)
+                p = qday["p"]
+                a, b = qday["a"], qday["b"]
+                G = qday["G"]
+                curve = EllipticCurve(p, a, b)
+                if not curve.is_point_on_curve(G):
+                    print("Error: generator G from JSON is not on the curve!")
+                    stress_rows.append((bits, None, "No", time.perf_counter() - t0))
+                    continue
+
+                curve_params = {"p": p, "a": a, "b": b, "Q": G, "curve": curve}
+                ecc_oracle = ECCOracle(curve_params)
+                n_qubits = 1 + ecc_oracle.get_num_target_qubits()
+                order_r = qday["subgroup_order"]
+
+                estimator = QSPPhaseEstimator(
+                    oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.0
+                )
+                if _use_alarm:
+                    old_handler = signal.signal(signal.SIGALRM, _stress_alarm_handler)
+                    signal.alarm(_STRESS_TIMEOUT_SEC)
+                try:
+                    estimated_phase = estimator.estimate_phase_binary_search(precision_bits=6)
+                finally:
+                    if _use_alarm:
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+
+                estimated_phase = estimated_phase % (2 * np.pi)
+                elapsed = time.perf_counter() - t0
+                end_iso = datetime.now().isoformat(timespec="seconds")
+                success = _ecc_order_recovery_success(estimated_phase, order_r)
+                succ_str = "Yes" if success else "No"
+
+                print(f"  end {end_iso} | elapsed {elapsed:.2f}s | Success (r): {succ_str}")
+
+                stress_rows.append((bits, n_qubits, succ_str, elapsed))
+
+                # Windows has no SIGALRM; detect long runs only after they finish.
+                if not _use_alarm and elapsed > _STRESS_TIMEOUT_SEC:
+                    print(
+                        f"Reached the limit of classical simulation at {bits} bits."
+                    )
+                    break
+
+            except MemoryError:
+                print(f"Reached the limit of classical simulation at {bits} bits.")
+                break
+            except TimeoutError:
+                print(f"Reached the limit of classical simulation at {bits} bits.")
+                break
+
+        print(f"\n{'='*70}")
+        print("STRESS TEST SUMMARY (Success = subgroup order r matches JSON)")
         print(
-            f"Warning: find_point_order(G)={order_check} != subgroup_order from JSON ({order_r})."
+            f"{'Bit Length':<12} | {'Qubits Used':<12} | {'Success (r)':<14} | {'Time (s)':<12}"
         )
-    key_ok = curve.scalar_multiply(json_private_key, G) == target_point_Q
-    print(f"Classical key check (d·G == Q_pub): {'PASS' if key_ok else 'FAIL'}")
-    print(f"  Generator G: {G}, public key Q: {target_point_Q}")
-    print(
-        "  JSON private_key d is for dataset validation only; this QSP demo recovers "
-        "subgroup order r from phase, not the discrete log d via quantum measurement."
-    )
+        print("-" * 60)
+        for row in stress_rows:
+            bl, nq, su, sec = row
+            nq_s = str(nq) if nq is not None else "N/A"
+            print(f"{bl:<12} | {nq_s:<12} | {su:<14} | {sec:<12.2f}")
+        print(f"{'='*70}\n")
 
-    # ECCOracle: U|P⟩ = |P+G⟩ (fixed generator G from competition data).
-    curve_params = {
-        "p": p,
-        "a": a,
-        "b": b,
-        "Q": G,
-        "curve": curve,
-        "target_public_key": target_point_Q,
-    }
-    ecc_oracle = ECCOracle(curve_params)
-    print(f"ECCOracle: {ecc_oracle.get_num_target_qubits()} target qubits, subgroup order {len(ecc_oracle._subgroup_points)}")
-    
-    # Eigenstate k=1 has eigenvalue e^(2πi/r), so expected phase = 2π/r
-    expected_phase = 2 * np.pi / order_r
-    print(f"Expected phase (eigenstate k=1): 2π/r = {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
-    
-    # ========================================================================
-    # Phase Estimation using QSP with ECCOracle
-    # ========================================================================
-    print(f"\n{'─'*70}")
-    print("ECC Oracle - IDEAL SIMULATION (Error Rate: 0.0%)")
-    print(f"{'─'*70}")
-    
-    estimator_ideal = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.0)
-    estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(precision_bits=6)
-    estimated_phase_ideal = estimated_phase_ideal % (2 * np.pi)
-    
-    error_ideal = abs(estimated_phase_ideal - expected_phase)
-    error_ideal = min(error_ideal, 2 * np.pi - error_ideal)
-    
-    print(f"\nResults (Ideal):")
-    print(f"  Expected:   {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
-    print(f"  Estimated:  {estimated_phase_ideal:.6f} rad ({np.degrees(estimated_phase_ideal):.2f}°)")
-    print(f"  Error:      {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
-    
-    # Recover order r from phase (phase ≈ 2π/r => phase/2π ≈ 1/r)
-    phase_normalized = estimated_phase_ideal / (2 * np.pi)
-    candidates = continued_fractions(phase_normalized, max_denom=order_r * 2)
-    print(f"\nPhase fraction candidates (k/r) from continued fractions:")
-    recovered_r = None
-    for k_cand, r_cand in candidates[:5]:
-        print(f"  k={k_cand}, r={r_cand}" + (" ✓" if r_cand == order_r else ""))
-        if r_cand == order_r and recovered_r is None:
-            recovered_r = r_cand
-    if recovered_r is not None:
-        print(f"\n✓ Recovered order: r = {recovered_r}")
-        match_json = recovered_r == qday["subgroup_order"]
-        print(f"  Matches JSON subgroup_order ({qday['subgroup_order']}): {'yes' if match_json else 'no'}")
     else:
-        recovered_r = order_r  # use known for summary
-        print(f"\n(Phase CF did not isolate r; JSON subgroup_order = {qday['subgroup_order']})")
+        QDAY_CURVE_BITS = 4  # or "4-bit"; use load_qday_curves(..., bit_length=6) etc.
+        qday = load_qday_curves(bit_length=QDAY_CURVE_BITS)
+        p = qday["p"]
+        a, b = qday["a"], qday["b"]
+        G = qday["G"]
+        target_point_Q = qday["public_key"]
+        json_private_key = qday["private_key"]
+        order_r = qday["subgroup_order"]
 
-    # ========================================================================
-    # ECC Oracle - Noisy Simulation
-    # ========================================================================
-    print(f"\n{'─'*70}")
-    print("ECC Oracle - NOISY SIMULATION (Error Rate: 2.0%)")
-    print(f"{'─'*70}")
-    
-    estimator_noisy = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.02)
-    estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(precision_bits=6)
-    estimated_phase_noisy = estimated_phase_noisy % (2 * np.pi)
-    
-    error_noisy = abs(estimated_phase_noisy - expected_phase)
-    error_noisy = min(error_noisy, 2 * np.pi - error_noisy)
-    
-    print(f"\nResults (Noisy):")
-    print(f"  Expected:   {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
-    print(f"  Estimated:  {estimated_phase_noisy:.6f} rad ({np.degrees(estimated_phase_noisy):.2f}°)")
-    print(f"  Error:      {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
-    
-    # ========================================================================
-    # Summary
-    # ========================================================================
-    print(f"\n{'='*70}")
-    print("ECC ORACLE SUMMARY")
-    print(f"{'='*70}")
-    print(f"Curve: y² = x³ + {b} (mod {p}), a={a}")
-    print(f"Generator G (oracle fixed point): {G}, subgroup order r: {order_r}")
-    print(f"ECCOracle: U|P⟩ = |P+Q⟩ (lookup-table, no classical cheating)")
-    print(f"\nIdeal (0% error):  Phase error = {error_ideal:.6f} rad")
-    print(f"Noisy (2% error):  Phase error = {error_noisy:.6f} rad")
-    print(f"\n{'='*70}\n")
+        print(f"\nQ-Day curve ({qday['bit_length']}-bit prime): y² = x³ + {b} (mod {p}), a={a}")
+        print(f"  subgroup_order (JSON): {order_r}, cofactor: {qday['cofactor']}")
+
+        curve = EllipticCurve(p, a, b)
+        if not curve.is_point_on_curve(G):
+            print("Error: generator G from JSON is not on the curve!")
+            exit(1)
+        order_check = curve.find_point_order(G)
+        if order_check != order_r:
+            print(
+                f"Warning: find_point_order(G)={order_check} != subgroup_order from JSON ({order_r})."
+            )
+        key_ok = curve.scalar_multiply(json_private_key, G) == target_point_Q
+        print(f"Classical key check (d·G == Q_pub): {'PASS' if key_ok else 'FAIL'}")
+        print(f"  Generator G: {G}, public key Q: {target_point_Q}")
+        print(
+            "  JSON private_key d is for dataset validation only; this QSP demo recovers "
+            "subgroup order r from phase, not the discrete log d via quantum measurement."
+        )
+
+        curve_params = {
+            "p": p,
+            "a": a,
+            "b": b,
+            "Q": G,
+            "curve": curve,
+            "target_public_key": target_point_Q,
+        }
+        ecc_oracle = ECCOracle(curve_params)
+        print(f"ECCOracle: {ecc_oracle.get_num_target_qubits()} target qubits, subgroup order {len(ecc_oracle._subgroup_points)}")
+
+        expected_phase = 2 * np.pi / order_r
+        print(f"Expected phase (eigenstate k=1): 2π/r = {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
+
+        print(f"\n{'─'*70}")
+        print("ECC Oracle - IDEAL SIMULATION (Error Rate: 0.0%)")
+        print(f"{'─'*70}")
+
+        estimator_ideal = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.0)
+        estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(precision_bits=6)
+        estimated_phase_ideal = estimated_phase_ideal % (2 * np.pi)
+
+        error_ideal = abs(estimated_phase_ideal - expected_phase)
+        error_ideal = min(error_ideal, 2 * np.pi - error_ideal)
+
+        print(f"\nResults (Ideal):")
+        print(f"  Expected:   {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
+        print(f"  Estimated:  {estimated_phase_ideal:.6f} rad ({np.degrees(estimated_phase_ideal):.2f}°)")
+        print(f"  Error:      {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
+
+        phase_normalized = estimated_phase_ideal / (2 * np.pi)
+        candidates = continued_fractions(phase_normalized, max_denom=order_r * 2)
+        print(f"\nPhase fraction candidates (k/r) from continued fractions:")
+        recovered_r = None
+        for k_cand, r_cand in candidates[:5]:
+            print(f"  k={k_cand}, r={r_cand}" + (" ✓" if r_cand == order_r else ""))
+            if r_cand == order_r and recovered_r is None:
+                recovered_r = r_cand
+        if recovered_r is not None:
+            print(f"\n✓ Recovered order: r = {recovered_r}")
+            match_json = recovered_r == qday["subgroup_order"]
+            print(f"  Matches JSON subgroup_order ({qday['subgroup_order']}): {'yes' if match_json else 'no'}")
+        else:
+            recovered_r = order_r
+            print(f"\n(Phase CF did not isolate r; JSON subgroup_order = {qday['subgroup_order']})")
+
+        print(f"\n{'─'*70}")
+        print("ECC Oracle - NOISY SIMULATION (Error Rate: 2.0%)")
+        print(f"{'─'*70}")
+
+        estimator_noisy = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.02)
+        estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(precision_bits=6)
+        estimated_phase_noisy = estimated_phase_noisy % (2 * np.pi)
+
+        error_noisy = abs(estimated_phase_noisy - expected_phase)
+        error_noisy = min(error_noisy, 2 * np.pi - error_noisy)
+
+        print(f"\nResults (Noisy):")
+        print(f"  Expected:   {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
+        print(f"  Estimated:  {estimated_phase_noisy:.6f} rad ({np.degrees(estimated_phase_noisy):.2f}°)")
+        print(f"  Error:      {error_noisy:.6f} rad ({np.degrees(error_noisy):.2f}°)")
+
+        print(f"\n{'='*70}")
+        print("ECC ORACLE SUMMARY")
+        print(f"{'='*70}")
+        print(f"Curve: y² = x³ + {b} (mod {p}), a={a}")
+        print(f"Generator G (oracle fixed point): {G}, subgroup order r: {order_r}")
+        print(f"ECCOracle: U|P⟩ = |P+Q⟩ (lookup-table, no classical cheating)")
+        print(f"\nIdeal (0% error):  Phase error = {error_ideal:.6f} rad")
+        print(f"Noisy (2% error):  Phase error = {error_noisy:.6f} rad")
+        print(f"\n{'='*70}\n")
 
     # ========================================================================
     # ScalableAdderOracle: Quantum arithmetic (Draper adder, O(n^2) gates)
