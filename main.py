@@ -255,6 +255,12 @@ def _ecc_bits_to_int(bits: list) -> int:
     return sum(int(b) << i for i, b in enumerate(bits))
 
 
+def _counts_key_to_int_lsb(key: str, n_bits: int) -> int:
+    """Decode Qiskit counts key: rightmost character is classical bit 0 (LSB)."""
+    k = key.replace(" ", "")
+    return sum(int(k[-1 - j]) << j for j in range(n_bits))
+
+
 # ==============================================================================
 # Quantum Arithmetic: QFT and Draper Adder
 # ==============================================================================
@@ -1100,8 +1106,37 @@ def get_noise_model(error_rate):
     return noise_model
 
 
+def build_standard_qpe_circuit(oracle: QuantumOracle, precision_bits: int) -> QuantumCircuit:
+    """
+    Textbook quantum phase estimation: m counting qubits, inverse QFT, measure.
+    Uses controlled-U^{2^j} on counting qubit j (Qiskit textbook ordering).
+    """
+    U = oracle.construct_circuit()
+    n = U.num_qubits
+    m = precision_bits
+    qc = QuantumCircuit(m + n, m)
+    oracle.prepare_eigenstate(qc, m)
+    for j in range(m):
+        qc.h(j)
+    for j in range(m):
+        Uj = U.power(2**j)
+        qc.append(Uj.control(1), [j] + list(range(m, m + n)))
+    qc.append(QFTGate(m).inverse(), range(m))
+    for j in range(m):
+        qc.measure(j, j)
+    return qc
+
+
 class QSPPhaseEstimator:
-    def __init__(self, oracle: QuantumOracle, degree=5, shots=1024, error_rate=0.0, backend_type='local'):
+    def __init__(
+        self,
+        oracle: QuantumOracle,
+        degree=5,
+        shots=1024,
+        error_rate=0.0,
+        backend_type="local",
+        preselected_ibm_backend=None,
+    ):
         """
         Initialize QSP Phase Estimator.
         
@@ -1112,6 +1147,8 @@ class QSPPhaseEstimator:
             error_rate (float): Depolarizing error rate (0.0 = noiseless, 0.01 = 1% error); local Aer only
             backend_type (str): 'local' for Aer simulator (default), 'ibm' for IBM Quantum hardware
                 (requires IBM_QUANTUM_TOKEN in environment, e.g. from a .env file)
+            preselected_ibm_backend: When backend_type is ``ibm``, reuse this backend instead of
+                calling ``least_busy`` again (multiple jobs share one device).
         """
         self.oracle = oracle
         self.degree = degree
@@ -1119,14 +1156,17 @@ class QSPPhaseEstimator:
         self.error_rate = error_rate
         self.backend_type = backend_type
         if backend_type == 'ibm':
-            token = os.getenv("IBM_QUANTUM_TOKEN")
-            if not token:
-                raise ValueError(
-                    "IBM_QUANTUM_TOKEN is not set. Create a .env file in the project directory "
-                    "with: IBM_QUANTUM_TOKEN=your_api_key_here"
-                )
-            service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
-            self.backend = service.least_busy(operational=True, simulator=False)
+            if preselected_ibm_backend is not None:
+                self.backend = preselected_ibm_backend
+            else:
+                token = os.getenv("IBM_QUANTUM_TOKEN")
+                if not token:
+                    raise ValueError(
+                        "IBM_QUANTUM_TOKEN is not set. Create a .env file in the project directory "
+                        "with: IBM_QUANTUM_TOKEN=your_api_key_here"
+                    )
+                service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+                self.backend = service.least_busy(operational=True, simulator=False)
             print(f"IBM Quantum hardware backend selected: {self.backend.name}")
             self.noise_model = None
         else:
@@ -1238,6 +1278,46 @@ class QSPPhaseEstimator:
             raise
         return counts.get('0', 0) / self.shots
 
+    def estimate_phase_standard_qpe(self, precision_bits: int) -> float:
+        """
+        Textbook QPE with m counting qubits and inverse QFT (controlled-U^{2^j} sequence).
+        Returns an estimate of the eigenphase in radians in [0, 2π).
+        """
+        qc = build_standard_qpe_circuit(self.oracle, precision_bits)
+        m = precision_bits
+        try:
+            if self.backend_type == "ibm":
+                pm = generate_preset_pass_manager(
+                    backend=self.backend, optimization_level=1
+                )
+                isa = pm.run(qc)
+                sampler = SamplerV2(mode=self.backend)
+                job = sampler.run([isa], shots=self.shots)
+                counts = job.result()[0].data.c.get_counts()
+                top = max(counts, key=counts.get)
+            elif self.noise_model is not None:
+                qc_run = _transpile_for_local_run(qc, self.backend)
+                job = self.backend.run(
+                    qc_run, shots=self.shots, noise_model=self.noise_model
+                )
+                counts = job.result().get_counts()
+                top = max(counts, key=counts.get)
+            else:
+                qc_run = _transpile_noiseless_qsp(qc, self.backend)
+                job = self.backend.run(qc_run, shots=self.shots)
+                counts = job.result().get_counts()
+                top = max(counts, key=counts.get)
+        except Exception:
+            if self.backend_type == "ibm":
+                print(
+                    "Standard QPE execution failed (check IBM_QUANTUM_TOKEN in .env and network/queue status)."
+                )
+            else:
+                print("Standard QPE execution failed.")
+            raise
+        x = int(top, 2)
+        phi = x / (2**m)
+        return (2 * np.pi * phi) % (2 * np.pi)
 
     def estimate_phase_binary_search(self, precision_bits=5):
         """
@@ -1699,6 +1779,19 @@ def continued_fractions(phi, max_denom=1000):
     return candidates
 
 
+def classical_discrete_log_bruteforce(curve: EllipticCurve, G, Q, r: int):
+    """
+    Find d in [0, r) with d·G == Q by exhaustive search. For small subgroup orders only.
+    Does not read any stored private key; use JSON private_key only to verify a candidate.
+    """
+    if r <= 0:
+        return None
+    for d in range(r):
+        if curve.scalar_multiply(d, G) == Q:
+            return d
+    return None
+
+
 def _ecc_order_recovery_success(estimated_phase, order_r):
     """
     True if continued fractions (first 5 candidates) recover subgroup order r.
@@ -1736,6 +1829,46 @@ def create_mock_ecc_unitary(theta):
     return qc
 
 
+def _ibm_strict_mod_p_demonstration(prime: int, x: int, C: int, backend, shots: int):
+    """
+    One-shot-style Sampler job: basis state |x⟩ on the data register, then
+    ``append_add_constant_mod_p`` (same gadget as ECC mod-p add). Dominant
+    data-register outcome should be (x + C) mod p.
+    """
+    n = strict_mod_p_register_bits(prime)
+    qc = QuantumCircuit(n + 1, n + 1)
+    reg = list(range(n))
+    borrow = n
+    x_bits = _ecc_int_to_bits(x, n)
+    for i in range(n):
+        if x_bits[i]:
+            qc.x(reg[i])
+    append_add_constant_mod_p(qc, reg, n, prime, C, borrow)
+    for i in range(n + 1):
+        qc.measure(i, i)
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=1)
+    isa = pm.run(qc)
+    sampler = SamplerV2(mode=backend)
+    job = sampler.run([isa], shots=shots)
+    jid = job.job_id()
+    counts = job.result()[0].data.c.get_counts()
+    top = max(counts, key=counts.get)
+    y = _counts_key_to_int_lsb(top, n)
+    expected = (x + C) % prime
+    ok = y == expected
+    print(
+        f"  strict mod-p add: x={x}, C={C}, p={prime} (Q-Day 4-bit prime) -> "
+        f"measured_data={y}, expected={expected} {'✓' if ok else '✗'}",
+        flush=True,
+    )
+    print(
+        f"  Sampler job_id: {jid}, shots={shots}, top outcome: {top} "
+        f"(freq={counts[top] / shots:.3f})",
+        flush=True,
+    )
+    return ok, jid
+
+
 if __name__ == "__main__":
     RUN_ON_IBM_HARDWARE = os.getenv("RUN_ON_IBM_HARDWARE", "").strip().lower() in (
         "1",
@@ -1750,24 +1883,62 @@ if __name__ == "__main__":
         "true",
         "yes",
     )
+    _EVIDENCE_MEASURE = os.getenv("ALPHASHOR_EVIDENCE_MEASURE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     _ECC_DEMO_SHOTS = 32 if _SUBMISSION_EVIDENCE else 512
     _ECC_PRECISION_BITS = 4 if _SUBMISSION_EVIDENCE else 6
 
     # Run IBM hardware before heavy local ECC / QSP demos so queue + job finish first.
     if RUN_ON_IBM_HARDWARE:
-        # Set IBM_QUANTUM_TOKEN in a .env file, or export RUN_ON_IBM_HARDWARE=1 with token set.
         print(f"\n{'='*70}", flush=True)
         print(
-            "IBM Quantum hardware smoke test (single QSP measurement, no full binary search)",
+            "IBM Quantum — Q-Day 4-bit prime gadgets + textbook QPE (full ECC oracle not shown)",
             flush=True,
         )
         print(f"{'='*70}", flush=True)
-        oracle_hw = MockPhaseOracle(phase=(2 / 3) * np.pi)
-        estimator_hw = QSPPhaseEstimator(
-            oracle=oracle_hw, degree=5, shots=1024, error_rate=0.0, backend_type="ibm"
+        token = os.getenv("IBM_QUANTUM_TOKEN")
+        if not token:
+            raise ValueError(
+                "RUN_ON_IBM_HARDWARE is set but IBM_QUANTUM_TOKEN is missing (.env or environment)."
+            )
+        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+        ibm_backend = service.least_busy(operational=True, simulator=False)
+        print(f"IBM backend: {ibm_backend.name}", flush=True)
+        shots_hw = 1024
+        qday_hw = load_qday_curves(bit_length=4)
+        p_hw = qday_hw["p"]
+        print("\n1) Strict GF(p) add (official prime from curves.json)", flush=True)
+        _ibm_strict_mod_p_demonstration(p_hw, 4, 2, ibm_backend, shots_hw)
+        print("\n2) ModPAdderOracle(p=prime) — standard QPE (controlled-U^{2^j})", flush=True)
+        modp_hw = ModPAdderOracle(p_hw, C=2)
+        est_modp_hw = QSPPhaseEstimator(
+            oracle=modp_hw,
+            degree=5,
+            shots=shots_hw,
+            error_rate=0.0,
+            backend_type="ibm",
+            preselected_ibm_backend=ibm_backend,
         )
-        p0 = estimator_hw.measure_probability(0.0)
-        print(f"Prob(|0⟩) at phase_shift=0: {p0:.4f}", flush=True)
+        ph_modp_hw = est_modp_hw.estimate_phase_standard_qpe(precision_bits=5)
+        print(f"  Estimated eigenphase (rad): {ph_modp_hw:.6f}", flush=True)
+        print("\n3) MockPhaseOracle — standard QPE sanity (θ = 2π/3)", flush=True)
+        mock_hw = MockPhaseOracle(phase=(2 / 3) * np.pi)
+        est_mock_hw = QSPPhaseEstimator(
+            oracle=mock_hw,
+            degree=5,
+            shots=shots_hw,
+            error_rate=0.0,
+            backend_type="ibm",
+            preselected_ibm_backend=ibm_backend,
+        )
+        ph_mock_hw = est_mock_hw.estimate_phase_standard_qpe(precision_bits=6)
+        exp_m = (2 / 3) * np.pi
+        err_m = abs(ph_mock_hw - exp_m)
+        err_m = min(err_m, 2 * np.pi - err_m)
+        print(f"  Estimated: {ph_mock_hw:.6f} rad, expected: {exp_m:.6f} rad, err: {err_m:.6f} rad", flush=True)
         print(f"{'='*70}\n", flush=True)
 
     actual_phase = (2/3) * np.pi 
@@ -1784,14 +1955,14 @@ if __name__ == "__main__":
     oracle = MockPhaseOracle(phase=actual_phase)
     
     # ========================================================================
-    # 1. Ideal Simulation (Noiseless)
+    # 1. Ideal Simulation (Noiseless) — textbook QPE for phase gate oracle
     # ========================================================================
     print(f"\n{'─'*70}")
-    print("1. IDEAL SIMULATION (Error Rate: 0.0%)")
+    print("1. IDEAL SIMULATION (Error Rate: 0.0%) — standard QPE + inverse QFT")
     print(f"{'─'*70}")
     
     estimator_ideal = QSPPhaseEstimator(oracle=oracle, degree=5, shots=2000, error_rate=0.0)
-    estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(precision_bits=6)
+    estimated_phase_ideal = estimator_ideal.estimate_phase_standard_qpe(precision_bits=6)
     
     error_ideal = abs(estimated_phase_ideal - actual_phase)
     # Handle wrap-around
@@ -1803,14 +1974,14 @@ if __name__ == "__main__":
     print(f"  Error:     {error_ideal:.6f} rad ({np.degrees(error_ideal):.2f}°)")
     
     # ========================================================================
-    # 2. Noisy Simulation (2% Depolarizing Error)
+    # 2. Noisy Simulation (2% Depolarizing Error) — same QPE circuit
     # ========================================================================
     print(f"\n{'─'*70}")
     print("2. NOISY SIMULATION (Error Rate: 2.0% - Demonstrating Robustness)")
     print(f"{'─'*70}")
     
     estimator_noisy = QSPPhaseEstimator(oracle=oracle, degree=5, shots=2000, error_rate=0.02)
-    estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(precision_bits=6)
+    estimated_phase_noisy = estimator_noisy.estimate_phase_standard_qpe(precision_bits=6)
     
     error_noisy = abs(estimated_phase_noisy - actual_phase)
     # Handle wrap-around
@@ -1832,8 +2003,8 @@ if __name__ == "__main__":
     if error_ideal > 0:
         print(f"Robustness:        {((error_noisy - error_ideal) / error_ideal * 100):+.1f}% degradation")
     print(f"\n{'='*70}")
-    print("Note: The QSP binary search demonstrates robustness by maintaining")
-    print("reasonable accuracy even with 2% depolarizing noise.")
+    print("Note: Textbook QPE (controlled-U^{2^j} + inverse QFT) is used for the")
+    print("mock phase gate; wide ECC demos below still use QSP + iterative binary search.")
     print(f"{'='*70}\n")
     
     # ========================================================================
@@ -1990,6 +2161,23 @@ if __name__ == "__main__":
                 "(simulation cost). Run `python main.py` without this env var on suitable hardware "
                 "to execute full QSP on the arithmetic oracle."
             )
+            if _EVIDENCE_MEASURE:
+                print(
+                    "\n  ALPHASHOR_EVIDENCE_MEASURE=1: MPS-backed measure_probability samples "
+                    "(quantum-sourced statistics; may be slow)"
+                )
+                _ev_shots = min(16, max(4, _ECC_DEMO_SHOTS))
+                est_ev = QSPPhaseEstimator(
+                    ecc_oracle, degree=5, shots=_ev_shots, error_rate=0.0
+                )
+                for ps in (0.0, expected_phase * 0.5):
+                    t_ms = time.perf_counter()
+                    pr = est_ev.measure_probability(ps)
+                    dt = time.perf_counter() - t_ms
+                    print(
+                        f"    phase_shift={ps:.6f} rad  P(|0⟩)={pr:.4f}  "
+                        f"(wall {dt:.2f}s, shots={_ev_shots})"
+                    )
             phase_normalized = expected_phase / (2 * np.pi)
             candidates = continued_fractions(phase_normalized, max_denom=order_r * 2)
             print(
@@ -2006,6 +2194,16 @@ if __name__ == "__main__":
                 print(
                     f"\n(CF did not isolate r in first candidates; JSON subgroup_order = {qday['subgroup_order']})"
                 )
+            r_dlp = recovered_r if recovered_r is not None else order_r
+            d_rec = classical_discrete_log_bruteforce(curve, G, target_point_Q, r_dlp)
+            if d_rec is not None:
+                vd = d_rec == json_private_key
+                print(
+                    f"\nClassical ECDLP (exhaustive on Z_r, r={r_dlp}): d={d_rec}  "
+                    f"(JSON private_key check: {'PASS' if vd else 'CHECK'})"
+                )
+            else:
+                print(f"\nClassical ECDLP bruteforce: no d in [0, {r_dlp}) with d·G == Q_pub")
             estimated_phase_ideal = expected_phase
             estimated_phase_noisy = expected_phase
             error_ideal = 0.0
@@ -2060,6 +2258,17 @@ if __name__ == "__main__":
                 recovered_r = order_r
                 print(f"\n(Phase CF did not isolate r; JSON subgroup_order = {qday['subgroup_order']})")
 
+            r_dlp = recovered_r if recovered_r is not None else order_r
+            d_rec = classical_discrete_log_bruteforce(curve, G, target_point_Q, r_dlp)
+            if d_rec is not None:
+                vd = d_rec == json_private_key
+                print(
+                    f"\nClassical ECDLP (exhaustive on Z_r, r={r_dlp}): d={d_rec}  "
+                    f"(JSON private_key check: {'PASS' if vd else 'CHECK'})"
+                )
+            else:
+                print(f"\nClassical ECDLP bruteforce: no d in [0, {r_dlp}) with d·G == Q_pub")
+
             print(f"\n{'─'*70}")
             print("ECC Oracle - NOISY SIMULATION (Error Rate: 2.0%)")
             print(f"{'─'*70}")
@@ -2105,10 +2314,10 @@ if __name__ == "__main__":
     print(f"  Expected phase (eigenstate k=1): 2π C/N = {expected_phase_adder:.6f} rad ({np.degrees(expected_phase_adder):.2f}°)")
 
     print(f"\n{'─'*70}")
-    print("ScalableAdderOracle - IDEAL SIMULATION")
+    print("ScalableAdderOracle - IDEAL SIMULATION (standard QPE)")
     print(f"{'─'*70}")
     est_adder = QSPPhaseEstimator(oracle=scalable_oracle, degree=5, shots=2000, error_rate=0.0)
-    estimated_phase_adder = est_adder.estimate_phase_binary_search(precision_bits=6)
+    estimated_phase_adder = est_adder.estimate_phase_standard_qpe(precision_bits=6)
     estimated_phase_adder = estimated_phase_adder % (2 * np.pi)
     error_adder = abs(estimated_phase_adder - expected_phase_adder)
     error_adder = min(error_adder, 2 * np.pi - error_adder)

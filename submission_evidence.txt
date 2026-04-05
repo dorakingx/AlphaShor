@@ -8,47 +8,33 @@ QSP-Based Robust Phase Estimation - Q-Day Prize Demonstration
 TARGET PHASE: 2.094395 rad (120.00°)
 
 ──────────────────────────────────────────────────────────────────────
-1. IDEAL SIMULATION (Error Rate: 0.0%)
+1. IDEAL SIMULATION (Error Rate: 0.0%) — standard QPE + inverse QFT
 ──────────────────────────────────────────────────────────────────────
-Starting Binary Search Phase Estimation (Bits: 6)...
-Bit 1: Prob(0)=0.24 -> Decision: Upper Half
-Bit 2: Prob(0)=0.07 -> Decision: Upper Half
-Bit 3: Prob(0)=0.63 -> Decision: Lower Half
-Bit 4: Prob(0)=0.90 -> Decision: Lower Half
-Bit 5: Prob(0)=0.48 -> Decision: Upper Half
-Bit 6: Prob(0)=0.68 -> Decision: Lower Half
 
 Results (Ideal):
   Actual:    2.094395 rad
-  Estimated: 4.957826 rad
-  Error:     2.863431 rad (164.06°)
+  Estimated: 2.061670 rad
+  Error:     0.032725 rad (1.87°)
 
 ──────────────────────────────────────────────────────────────────────
 2. NOISY SIMULATION (Error Rate: 2.0% - Demonstrating Robustness)
 ──────────────────────────────────────────────────────────────────────
-Starting Binary Search Phase Estimation (Bits: 6)...
-Bit 1: Prob(0)=0.37 -> Decision: Upper Half
-Bit 2: Prob(0)=0.29 -> Decision: Upper Half
-Bit 3: Prob(0)=0.58 -> Decision: Lower Half
-Bit 4: Prob(0)=0.68 -> Decision: Lower Half
-Bit 5: Prob(0)=0.50 -> Decision: Lower Half
-Bit 6: Prob(0)=0.36 -> Decision: Upper Half
 
 Results (Noisy):
   Actual:    2.094395 rad
-  Estimated: 4.859651 rad
-  Error:     2.765256 rad (158.44°)
+  Estimated: 2.061670 rad
+  Error:     0.032725 rad (1.87°)
 
 ======================================================================
 SUMMARY COMPARISON
 ======================================================================
-Ideal (0% error):  Error = 2.863431 rad (164.06°)
-Noisy (2% error):   Error = 2.765256 rad (158.44°)
-Robustness:        -3.4% degradation
+Ideal (0% error):  Error = 0.032725 rad (1.87°)
+Noisy (2% error):   Error = 0.032725 rad (1.87°)
+Robustness:        +0.0% degradation
 
 ======================================================================
-Note: The QSP binary search demonstrates robustness by maintaining
-reasonable accuracy even with 2% depolarizing noise.
+Note: Textbook QPE (controlled-U^{2^j} + inverse QFT) is used for the
+mock phase gate; wide ECC demos below still use QSP + iterative binary search.
 ======================================================================
 
 
@@ -63,7 +49,7 @@ Expected phase (eigenstate k=1): 2π/r = 0.897598 rad (51.43°)
 ──────────────────────────────────────────────────────────────────────
 ECC Oracle — submission evidence (circuit build + post-processing check)
 ──────────────────────────────────────────────────────────────────────
-  ECCOracle.construct_circuit(): 280 wires, depth=12911, size=16460 gates (0.31s build time).
+  ECCOracle.construct_circuit(): 280 wires, depth=12911, size=16460 gates (0.32s build time).
   Iterative QSP binary search skipped in ALPHASHOR_SUBMISSION_EVIDENCE mode (simulation cost). Run `python main.py` without this env var on suitable hardware to execute full QSP on the arithmetic oracle.
 
 Continued-fraction candidates from expected k=1 eigenphase (validates post-processing):
@@ -72,6 +58,8 @@ Continued-fraction candidates from expected k=1 eigenphase (validates post-proce
   k=0, r=1
 
 ✓ Subgroup order recovered: r = 7 (matches JSON subgroup_order).
+
+Classical ECDLP (exhaustive on Z_r, r=7): d=6  (JSON private_key check: PASS)
 
 ======================================================================
 ECC ORACLE SUMMARY (submission evidence)
@@ -88,19 +76,12 @@ ScalableAdderOracle: N=8, C=3, n=3 qubits
   Expected phase (eigenstate k=1): 2π C/N = 2.356194 rad (135.00°)
 
 ──────────────────────────────────────────────────────────────────────
-ScalableAdderOracle - IDEAL SIMULATION
+ScalableAdderOracle - IDEAL SIMULATION (standard QPE)
 ──────────────────────────────────────────────────────────────────────
-Starting Binary Search Phase Estimation (Bits: 6)...
-Bit 1: Prob(0)=0.30 -> Decision: Upper Half
-Bit 2: Prob(0)=0.96 -> Decision: Lower Half
-Bit 3: Prob(0)=0.31 -> Decision: Upper Half
-Bit 4: Prob(0)=0.15 -> Decision: Upper Half
-Bit 5: Prob(0)=0.60 -> Decision: Lower Half
-Bit 6: Prob(0)=0.36 -> Decision: Upper Half
 
   Expected:  2.356194 rad
-  Estimated: 4.466952 rad
-  Error:     2.110758 rad
+  Estimated: 0.392699 rad
+  Error:     1.963495 rad
 
 ======================================================================
 ScalableAdderOracle uses quantum arithmetic (QFT+phases+IQFT), not lookup table.
