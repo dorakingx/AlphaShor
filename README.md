@@ -94,9 +94,14 @@ The file [`submission_evidence.txt`](submission_evidence.txt) is a **captured ru
 ALPHASHOR_SUBMISSION_EVIDENCE=1 PYTHONUNBUFFERED=1 python -u main.py > submission_evidence.txt 2>&1
 ```
 
+Leave **`RUN_ON_IBM_HARDWARE` unset** for this capture so the log stays **simulation-only** (no IBM Quantum queue or warnings).
+
 That mode uses the **official 4-bit Q-Day curve** from [`curves/curves.json`](curves/curves.json): it records **Aer-backed** simulation for the mock QSP demo and arithmetic regression blocks, **builds** the full **`ECCOracle`** circuit (wire count, depth, gate count), and validates **subgroup order $r=7$** against JSON via the **continued-fraction** post-processing chain on the **expected $k=1$** eigenphase $2\pi/r$. Full iterative QSP on the wide arithmetic oracle is **skipped** in this mode because each shot is prohibitively expensive at current widths; run `python main.py` **without** `ALPHASHOR_SUBMISSION_EVIDENCE` on suitable memory or tensor-network backends for end-to-end QSP.
 
 ### What `main.py` prints (order of sections)
+
+0. **IBM Quantum smoke** (only if **`RUN_ON_IBM_HARDWARE=1`** and **`IBM_QUANTUM_TOKEN`** is set)  
+   **`MockPhaseOracle`** + **`SamplerV2`** on a **least-busy** backend; one **`measure_probability`** call, then the sections below.
 
 1. **Mock phase oracle — QSP sanity check**  
    Ideal (**0%**) vs **2% depolarizing** iterative binary search; reports **phase error** in radians and degrees.
@@ -112,8 +117,9 @@ That mode uses the **official 4-bit Q-Day curve** from [`curves/curves.json`](cu
 
 | Flag | Role |
 |------|------|
-| **`RUN_ECC_STRESS_TEST`** | **`False`**: run single-curve ECC QSP demo. **`True`**: sweep multiple Q-Day bit lengths (heavy). |
+| **`RUN_ECC_STRESS_TEST`** | In code: **`False`**: run single-curve ECC QSP demo. **`True`**: sweep multiple Q-Day bit lengths (heavy). |
 | **`RUN_ON_IBM_HARDWARE`** | Env: **`1`/`true`/`yes`**: IBM Quantum smoke test (**mock** oracle only); requires **`.env`** token. |
+| **`ALPHASHOR_SUBMISSION_EVIDENCE`** | Env: **`1`/`true`/`yes`**: lower ECC QSP cost, skip wide iterative QSP; use when capturing [`submission_evidence.txt`](submission_evidence.txt). |
 | **`QDAY_CURVE_BITS`** | ECC demo curve size when not stress-testing (e.g. **4** or **6**). |
 
 ### What “success” looks like
