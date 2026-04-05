@@ -57,7 +57,7 @@ The **measured phase statistics** in the ECC demo arise from applying the **quan
 
 **Simulation (Qiskit Aer).**
 
-- **`QSPPhaseEstimator`** uses the default **`AerSimulator()`** (statevector-style simulation path) for the **mock** oracle and, when memory allows, for **ECC + QSP**.
+- **`QSPPhaseEstimator`** uses the default **`AerSimulator()`** (statevector) when the total width is small; for **wide** targets (\(1 + n_{\mathrm{tgt}} > 34\)) it switches to **`matrix_product_state`** so shots are at least *runnable* (still costly for deep QSP sequences).
 - **`ECCOracle`** allocates **data + ancillas**; `main.py` prints a **memory warning** when the oracle’s target qubit count is large. On typical laptops, **end-to-end ECC + QSP** on the **official** JSON curves may **exhaust statevector memory**—this is a **simulation resource** limit, not an assertion that the construction is classical.
 - **`AerSimulator(method="matrix_product_state")`** is used in **`__main__`** for the **ModPInverseOracle** regression block (wide inverse circuit). It is **not** currently wired into **`QSPPhaseEstimator`** for ECC; extending the estimator with an **optional MPS (or other tensor) backend** is a natural follow-up for wide-stack runs.
 
@@ -85,6 +85,16 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
+
+### Submission evidence log
+
+The file [`submission_evidence.txt`](submission_evidence.txt) is a **captured run** used for Q-Day Prize submission. Regenerate it (after installing dependencies) with:
+
+```bash
+ALPHASHOR_SUBMISSION_EVIDENCE=1 PYTHONUNBUFFERED=1 python -u main.py > submission_evidence.txt 2>&1
+```
+
+That mode uses the **official 4-bit Q-Day curve** from [`curves/curves.json`](curves/curves.json): it records **Aer-backed** simulation for the mock QSP demo and arithmetic regression blocks, **builds** the full **`ECCOracle`** circuit (wire count, depth, gate count), and validates **subgroup order \(r=7\)** against JSON via the **continued-fraction** post-processing chain on the **expected \(k=1\)** eigenphase \(2\pi/r\). Full iterative QSP on the wide arithmetic oracle is **skipped** in this mode because each shot is prohibitively expensive at current widths; run `python main.py` **without** `ALPHASHOR_SUBMISSION_EVIDENCE` on suitable memory or tensor-network backends for end-to-end QSP.
 
 ### What `main.py` prints (order of sections)
 
@@ -132,6 +142,10 @@ flowchart LR
 | [`main.py`](main.py) | QSP angles, oracles (**`ECCOracle`**, adders, inverse), **`QSPPhaseEstimator`**, `__main__` driver |
 | [`curves/curves.json`](curves/curves.json) | Official-format Q-Day curve entries |
 | [`requirements.txt`](requirements.txt) | Python dependencies |
+| [`submission_evidence.txt`](submission_evidence.txt) | Regenerated evidence log (see **Submission evidence log** under Usage) |
+| [`LICENSE`](LICENSE) | MIT License (2026, AlphaShor Contributors) |
+
+This project is released under the [MIT License](LICENSE).
 
 ---
 
