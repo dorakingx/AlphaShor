@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, transpile
 from qiskit_ibm_runtime import QiskitRuntimeService
-from qiskit_aer import Aer
+from qiskit_aer import Aer, AerSimulator
 from qiskit.visualization import plot_histogram
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 import json
@@ -28,6 +28,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _transpile_for_local_run(qc, backend):
+    """Transpile for AerSimulator: optimization_level=0 avoids heavy basis passes."""
+    return transpile(qc, backend, optimization_level=0, seed_transpiler=42)
+
+
+def _transpile_noiseless_qsp(qc, backend):
+    """Same as local run; noiseless QSP path uses AerSimulator target."""
+    return transpile(qc, backend, optimization_level=0, seed_transpiler=42)
+
 
 # ==============================================================================
 # 1. QSP Angle Optimization (The Math Core)
@@ -613,7 +624,7 @@ class QSPPhaseEstimator:
             print(f"IBM Quantum hardware backend selected: {self.backend.name}")
             self.noise_model = None
         else:
-            self.backend = Aer.get_backend('qasm_simulator')
+            self.backend = AerSimulator()
             self.noise_model = get_noise_model(error_rate) if error_rate > 0 else None
         self.angles = self._get_angles(degree)
         
@@ -673,14 +684,18 @@ class QSPPhaseEstimator:
             float: Probability of measuring |0⟩ on ancilla qubit
         """
         qc = self.build_qsp_circuit(phase_shift)
-        qc_t = transpile(qc, self.backend)
         try:
             if self.backend_type == 'ibm':
-                job = self.backend.run(qc_t, shots=self.shots)
+                qc_run = transpile(qc, self.backend)
+                job = self.backend.run(qc_run, shots=self.shots)
             elif self.noise_model is not None:
-                job = self.backend.run(qc_t, shots=self.shots, noise_model=self.noise_model)
+                qc_run = _transpile_for_local_run(qc, self.backend)
+                job = self.backend.run(
+                    qc_run, shots=self.shots, noise_model=self.noise_model
+                )
             else:
-                job = self.backend.run(qc_t, shots=self.shots)
+                qc_run = _transpile_noiseless_qsp(qc, self.backend)
+                job = self.backend.run(qc_run, shots=self.shots)
             counts = job.result().get_counts()
         except Exception:
             if self.backend_type == 'ibm':
@@ -1192,7 +1207,10 @@ def create_mock_ecc_unitary(theta):
 
 if __name__ == "__main__":
     RUN_ON_IBM_HARDWARE = False
-    RUN_ECC_STRESS_TEST = True
+    # Set True to sweep Q-Day bit lengths (can be slow / memory-heavy at high bits).
+    RUN_ECC_STRESS_TEST = False
+    # ECC lookup-table circuits are heavy to transpile/simulate; lower shots keeps runtime practical.
+    _ECC_DEMO_SHOTS = 512
 
     actual_phase = (2/3) * np.pi 
     print(f"\n{'='*70}")
@@ -1292,7 +1310,7 @@ if __name__ == "__main__":
                 order_r = qday["subgroup_order"]
 
                 estimator = QSPPhaseEstimator(
-                    oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.0
+                    oracle=ecc_oracle, degree=5, shots=_ECC_DEMO_SHOTS, error_rate=0.0
                 )
                 if _use_alarm:
                     old_handler = signal.signal(signal.SIGALRM, _stress_alarm_handler)
@@ -1388,7 +1406,9 @@ if __name__ == "__main__":
         print("ECC Oracle - IDEAL SIMULATION (Error Rate: 0.0%)")
         print(f"{'─'*70}")
 
-        estimator_ideal = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.0)
+        estimator_ideal = QSPPhaseEstimator(
+            oracle=ecc_oracle, degree=5, shots=_ECC_DEMO_SHOTS, error_rate=0.0
+        )
         estimated_phase_ideal = estimator_ideal.estimate_phase_binary_search(precision_bits=6)
         estimated_phase_ideal = estimated_phase_ideal % (2 * np.pi)
 
@@ -1420,7 +1440,9 @@ if __name__ == "__main__":
         print("ECC Oracle - NOISY SIMULATION (Error Rate: 2.0%)")
         print(f"{'─'*70}")
 
-        estimator_noisy = QSPPhaseEstimator(oracle=ecc_oracle, degree=5, shots=2000, error_rate=0.02)
+        estimator_noisy = QSPPhaseEstimator(
+            oracle=ecc_oracle, degree=5, shots=_ECC_DEMO_SHOTS, error_rate=0.02
+        )
         estimated_phase_noisy = estimator_noisy.estimate_phase_binary_search(precision_bits=6)
         estimated_phase_noisy = estimated_phase_noisy % (2 * np.pi)
 
@@ -1480,8 +1502,6 @@ if __name__ == "__main__":
     print(f"ModPAdderOracle: p={p_mod}, C={C_mod}, n={n_mod} qubits (O(n^2) QFT adder, no lookup)")
     print(f"  Circuit depth: {modp_circuit.depth()}, gates: {modp_circuit.size()}")
     print(f"  Implements (x+C) mod {N_mod}; for strict (x+C) mod p see Add-Subtract-Controlled block.")
-    from qiskit import transpile
-    from qiskit_aer import AerSimulator
     sim = AerSimulator()
     n_data = modp_oracle._n
     for x in range(min(p_mod, N_mod)):
@@ -1491,7 +1511,7 @@ if __name__ == "__main__":
                 qc.x(j)
         qc.append(modp_circuit, range(n_mod))
         qc.measure_all()
-        job = sim.run(transpile(qc, sim), shots=1)
+        job = sim.run(_transpile_for_local_run(qc, sim), shots=1)
         result = int(list(job.result().get_counts().keys())[0], 2)
         result_data = result & ((1 << n_data) - 1)
         expected_mod2n = (x + C_mod) % N_mod
@@ -1515,7 +1535,7 @@ if __name__ == "__main__":
                 qc.x(j)
         qc.append(mult_circuit, range(n_mul))
         qc.measure_all()
-        job = sim.run(transpile(qc, sim), shots=1)
+        job = sim.run(_transpile_for_local_run(qc, sim), shots=1)
         result_bits = list(job.result().get_counts().keys())[0]
         # R register = qubits n_bits..2*n_bits-1; key leftmost = qubit 2n (ancilla), then R
         r_bits = result_bits[1 : 1 + n_bits]

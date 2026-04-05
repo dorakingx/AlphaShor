@@ -1,0 +1,8 @@
+# Use Python 3.10–3.12 if possible (Qiskit / Aer can misbehave on 3.14+).
+# python3.12 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.24,<3
+scipy>=1.10
+qiskit>=1.2.0,<2.2
+qiskit-aer>=0.14.0
+qiskit-ibm-runtime>=0.25.0
+python-dotenv>=1.0.0
