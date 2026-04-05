@@ -14,8 +14,9 @@ import numpy as np
 from abc import ABC, abstractmethod
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, transpile
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 from qiskit.circuit.library import QFTGate
-from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
 from qiskit_aer import Aer, AerSimulator
 from qiskit.visualization import plot_histogram
 from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -1124,7 +1125,7 @@ class QSPPhaseEstimator:
                     "IBM_QUANTUM_TOKEN is not set. Create a .env file in the project directory "
                     "with: IBM_QUANTUM_TOKEN=your_api_key_here"
                 )
-            service = QiskitRuntimeService(channel="ibm_quantum", token=token)
+            service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
             self.backend = service.least_busy(operational=True, simulator=False)
             print(f"IBM Quantum hardware backend selected: {self.backend.name}")
             self.noise_model = None
@@ -1210,17 +1211,23 @@ class QSPPhaseEstimator:
         qc = self.build_qsp_circuit(phase_shift)
         try:
             if self.backend_type == 'ibm':
-                qc_run = transpile(qc, self.backend)
-                job = self.backend.run(qc_run, shots=self.shots)
+                pm = generate_preset_pass_manager(
+                    backend=self.backend, optimization_level=1
+                )
+                isa_circuit = pm.run(qc)
+                sampler = SamplerV2(mode=self.backend)
+                job = sampler.run([isa_circuit], shots=self.shots)
+                counts = job.result()[0].data.c.get_counts()
             elif self.noise_model is not None:
                 qc_run = _transpile_for_local_run(qc, self.backend)
                 job = self.backend.run(
                     qc_run, shots=self.shots, noise_model=self.noise_model
                 )
+                counts = job.result().get_counts()
             else:
                 qc_run = _transpile_noiseless_qsp(qc, self.backend)
                 job = self.backend.run(qc_run, shots=self.shots)
-            counts = job.result().get_counts()
+                counts = job.result().get_counts()
         except Exception:
             if self.backend_type == 'ibm':
                 print(
@@ -1730,7 +1737,11 @@ def create_mock_ecc_unitary(theta):
 
 
 if __name__ == "__main__":
-    RUN_ON_IBM_HARDWARE = False
+    RUN_ON_IBM_HARDWARE = os.getenv("RUN_ON_IBM_HARDWARE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     # Set True to sweep Q-Day bit lengths (can be slow / memory-heavy at high bits).
     RUN_ECC_STRESS_TEST = False
     # For submission_evidence.txt: ALPHASHOR_SUBMISSION_EVIDENCE=1 lowers ECC cost (still official 4-bit curve).
@@ -1741,6 +1752,23 @@ if __name__ == "__main__":
     )
     _ECC_DEMO_SHOTS = 32 if _SUBMISSION_EVIDENCE else 512
     _ECC_PRECISION_BITS = 4 if _SUBMISSION_EVIDENCE else 6
+
+    # Run IBM hardware before heavy local ECC / QSP demos so queue + job finish first.
+    if RUN_ON_IBM_HARDWARE:
+        # Set IBM_QUANTUM_TOKEN in a .env file, or export RUN_ON_IBM_HARDWARE=1 with token set.
+        print(f"\n{'='*70}", flush=True)
+        print(
+            "IBM Quantum hardware smoke test (single QSP measurement, no full binary search)",
+            flush=True,
+        )
+        print(f"{'='*70}", flush=True)
+        oracle_hw = MockPhaseOracle(phase=(2 / 3) * np.pi)
+        estimator_hw = QSPPhaseEstimator(
+            oracle=oracle_hw, degree=5, shots=1024, error_rate=0.0, backend_type="ibm"
+        )
+        p0 = estimator_hw.measure_probability(0.0)
+        print(f"Prob(|0⟩) at phase_shift=0: {p0:.4f}", flush=True)
+        print(f"{'='*70}\n", flush=True)
 
     actual_phase = (2/3) * np.pi 
     if _SUBMISSION_EVIDENCE:
@@ -2202,17 +2230,3 @@ if __name__ == "__main__":
             f"  |{x_inv}⟩|1⟩ -> second reg |{y_inv}⟩  (x^(-1) mod 5 = {exp_inv}) {'✓' if y_inv == exp_inv else '✗'}"
         )
     print(f"{'='*70}\n")
-
-    if RUN_ON_IBM_HARDWARE:
-        # Before setting RUN_ON_IBM_HARDWARE = True, create a .env file with:
-        #   IBM_QUANTUM_TOKEN=your_api_key_here
-        print(f"\n{'='*70}")
-        print("IBM Quantum hardware smoke test (single QSP measurement, no full binary search)")
-        print(f"{'='*70}")
-        oracle_hw = MockPhaseOracle(phase=(2 / 3) * np.pi)
-        estimator_hw = QSPPhaseEstimator(
-            oracle=oracle_hw, degree=5, shots=1024, error_rate=0.0, backend_type="ibm"
-        )
-        p0 = estimator_hw.measure_probability(0.0)
-        print(f"Prob(|0⟩) at phase_shift=0: {p0:.4f}")
-        print(f"{'='*70}\n")

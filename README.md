@@ -63,7 +63,7 @@ The **measured phase statistics** in the ECC demo arise from applying the **quan
 
 **Stress testing.** Set **`RUN_ECC_STRESS_TEST = True`** in `if __name__ == "__main__"` to sweep **Q-Day** bit lengths (timeouts / memory may stop the sweep early).
 
-**IBM Quantum.** Set **`RUN_ON_IBM_HARDWARE = True`** and provide **`IBM_QUANTUM_TOKEN`** in a **`.env`** file. The bundled hook runs a **short smoke test** with **`MockPhaseOracle`** (not the full **ECC** stack); it demonstrates **runtime integration** for future **hardware** experiments.
+**IBM Quantum.** Export **`RUN_ON_IBM_HARDWARE=1`** (or set it when invoking Python) and provide **`IBM_QUANTUM_TOKEN`** in a **`.env`** file. A **short smoke test** with **`MockPhaseOracle`** runs **first** (not the full **ECC** stack), then the usual local demos continue; this uses **Qiskit Runtime `SamplerV2`** on a **least-busy** device.
 
 ---
 
@@ -113,7 +113,7 @@ That mode uses the **official 4-bit Q-Day curve** from [`curves/curves.json`](cu
 | Flag | Role |
 |------|------|
 | **`RUN_ECC_STRESS_TEST`** | **`False`**: run single-curve ECC QSP demo. **`True`**: sweep multiple Q-Day bit lengths (heavy). |
-| **`RUN_ON_IBM_HARDWARE`** | **`True`**: IBM Quantum smoke test (**mock** oracle only); requires **`.env`** token. |
+| **`RUN_ON_IBM_HARDWARE`** | Env: **`1`/`true`/`yes`**: IBM Quantum smoke test (**mock** oracle only); requires **`.env`** token. |
 | **`QDAY_CURVE_BITS`** | ECC demo curve size when not stress-testing (e.g. **4** or **6**). |
 
 ### What “success” looks like
