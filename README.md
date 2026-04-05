@@ -1,244 +1,142 @@
-# QSP-Based Robust Phase Estimation for Shor's Algorithm
+# AlphaShor: Scalable Quantum Cryptanalysis for the Q-Day Prize
 
-## Project Overview
+## Executive summary
 
-This project presents a **revolutionary approach** to Shor's algorithm for the Q-Day Prize competition, addressing the critical scalability bottleneck that prevents standard implementations from running on near-term quantum hardware.
+**AlphaShor** targets the **elliptic-curve discrete logarithm problem (ECDLP)** in the spirit of Shor’s period-finding / phase-estimation pipeline. The repository implements a **pure, scalable quantum circuit** for **fixed-point elliptic-curve addition** \(U|P\rangle = |P+Q\rangle\) over \(\mathbb{F}_p\), built from **reversible modular arithmetic** (QFT-based adders and out-of-place mod-\(p\) multiplication). We **do not** synthesize that unitary from a classical transition table.
 
-### The Problem: Ancilla Qubit Explosion
-
-Traditional Shor's algorithm implementations use **Quantum Phase Estimation (QPE) with Quantum Fourier Transform (QFT)**, which requires **n ancilla qubits for n bits of precision**. This exponential ancilla requirement makes it **fundamentally unfeasible** for near-term quantum hardware:
-
-- For a 256-bit ECC key: **256+ ancilla qubits** needed
-- Current quantum computers: **~100-1000 qubits total** (including ancillas)
-- **Result**: Standard QPE+QFT cannot scale to cryptographically relevant key sizes
-
-### Our Solution: Quantum Signal Processing (QSP) with Single Ancilla
-
-We leverage **Quantum Signal Processing (QSP)** to perform robust phase estimation with **only 1 single ancilla qubit**, regardless of precision requirements. This represents an **exponential reduction** in ancilla qubit requirements:
-
-- **Same precision** as traditional QPE
-- **1 ancilla qubit** instead of n qubits
-- **Scalable** to cryptographically relevant key sizes
-- **Robust** against noise through iterative binary search
-
-### Key Advantages for Q-Day Prize
-
-1. **Hardware Feasibility**: Our approach can run on current quantum hardware, enabling real-world ECC key breaking demonstrations
-2. **Scalability**: Linear ancilla scaling (1 qubit) vs exponential (n qubits) means we can target larger keys
-3. **Robustness**: Iterative binary search and noise simulation prove resilience against depolarizing errors
-4. **Extensibility**: Oracle Pattern architecture allows seamless integration of ECC Point Addition unitary
+Phase information is extracted with **Quantum Signal Processing (QSP)** using **iterative binary-search phase estimation** on a **single ancilla** qubit, with optional **depolarizing noise** in simulation. Official competition curve parameters live in [`curves/curves.json`](curves/curves.json); the driver and algorithms are in [`main.py`](main.py).
 
 ---
 
-## Competition Details
+## Core innovations
 
-- **Prize**: 1 Bitcoin
-- **Deadline**: April 5, 2026
-- **Objective**: Break the largest ECC key using Shor's algorithm.
+### 1. QSP-based phase estimation
 
----
+Textbook **quantum phase estimation (QPE)** with a full **QFT** on multiple readout qubits typically scales the **readout register** with desired precision. **QSP** lets us shape a response polynomial in the signal operator while keeping a **compact** control layout: here, **one phase ancilla** plus the **target register** that carries the oracle unitary.
 
-## Our Technical Strategy
+In code, [`QSPPhaseEstimator`](main.py) builds alternating **controlled-\(U\)** layers (from [`QuantumOracle.construct_circuit()`](main.py)) and **\(Z\)-rotations** from pre-optimized QSP angles. **Iterative binary search** refines the phase window using repeated **`measure_probability(phase_shift)`** calls. **Robustness** is demonstrated by comparing **noiseless** Aer runs to runs with a **depolarizing** noise model on single- and two-qubit gates (`error_rate` in the estimator).
 
-### 1. Quantum Signal Processing (QSP)
+### 2. Pure quantum field arithmetic (ECC point addition)
 
-**QSP** is a powerful framework that allows us to apply polynomial transformations to eigenvalues using only a single ancilla qubit. Our implementation:
+[`ECCOracle`](main.py) implements **in-place** point addition \(P \mapsto P+Q\) for a **classical fixed** curve point \(Q\), on a register encoding \((x,y)\) with **strict mod-\(p\)** width `strict_mod_p_register_bits(p)` so intermediate additions stay in the range required by the modular-reduction gadgets.
 
-- **Numerical Optimization**: Uses `scipy.optimize.minimize` (BFGS method) to compute optimal QSP angles
-- **Step Function Approximation**: Creates a low-pass filter polynomial for phase discrimination
-- **Pre-computed Angles**: Includes optimized angles for common degrees to ensure stability
+Building blocks include:
 
-**Key Insight**: QSP encodes the phase information in the ancilla qubit's measurement statistics, eliminating the need for multiple ancilla qubits.
+- **Draper-style** QFT adders and **double-and-add–style** **mod-\(p\)** multiplication via **`append_mult_mod_p_out_of_place`** (gate complexity **\(O(n^3)\)** per multiply, as documented in code).
+- **Strict mod-\(p\)** addition and reduction using **`append_add_constant_mod_p`**, **`append_add_into_mod_p`**, and **`append_subtract_p_with_borrow_addback`**.
 
-### 2. Single Ancilla Architecture
+**Important:** modular multiplication for slope and line arithmetic is **mod \(p\)**, not mod \(2^n\): we do **not** route the ECC path through [`ModularMultiplierOracle`](main.py), which assumes **\(N=2^n\)**.
 
-Our `QSPPhaseEstimator` class maintains strict adherence to the **single ancilla constraint**:
+### 3. Fermat inverse and Bennett-style uncomputation
 
-- **1 ancilla qubit** for all operations
-- **n target qubits** for the unitary (e.g., ECC Point Addition)
-- **Total**: 1 + n qubits (vs 2n+ for traditional QPE)
+The slope \(\lambda\) uses **\((\Delta x)^{-1} \bmod p\)**. We avoid a reversible extended-Euclidean gadget chain and instead use **Fermat’s little theorem**: \(x^{-1} \equiv x^{p-2} \pmod p\) for prime \(p\), implemented as **`append_mod_p_fermat_inverse`** (and wrapped for benchmarking as [`ModPInverseOracle`](main.py)), using repeated **out-of-place mod-\(p\)** multiplies and dedicated borrow wires.
 
-This architecture enables:
-- Running on current quantum hardware
-- Scaling to larger problem sizes
-- Demonstrating practical cryptanalysis
-
-### 3. Iterative Binary Search Phase Estimation
-
-Instead of measuring all bits simultaneously (requiring n ancillas), we use **iterative binary search**:
-
-- **Each iteration** halves the search space
-- **6 iterations** = 6 bits of precision (64 possible values)
-- **Single ancilla** reused across iterations
-- **High precision** achieved through sequential refinement
-
-**Robustness**: Binary search naturally handles noise by averaging over multiple measurements.
-
-### 4. Robustness Demonstration
-
-We prove our approach is robust through **noise simulation**:
-
-- **Depolarizing Error Model**: Realistic noise for near-term hardware
-- **2% Error Rate**: Tests resilience under significant noise
-- **Results**: Maintains reasonable accuracy even with 2% depolarizing noise
-- **Comparison**: Ideal vs Noisy simulations demonstrate graceful degradation
-
-### 5. Numerical Optimization
-
-Our QSP angle calculation uses **rigorous numerical optimization**:
-
-- **Loss Function**: Minimizes distance between QSP response and target step function
-- **BFGS Method**: Efficient gradient-based optimization
-- **Chebyshev Approximation**: High-quality polynomial approximation
-- **No Heuristics**: Mathematically sound angle computation
+Arithmetic leaves **ancilla garbage**. [`ECCOracle.construct_circuit`](main.py) therefore follows a **Bennett-style** pattern: run a **forward** block that writes \((x_r,y_r)\) into zero-initialized output registers, **SWAP** the **data** registers with those outputs, then apply **`forward.inverse()`** on the **same** work and ancilla space so junk is uncomputed while the **result** remains on the original **data** wires—preserving **unitarity** and **phase coherence** needed for controlled-\(U\) in QSP.
 
 ---
 
-## Implementation Architecture
+## Strict compliance: no classical shortcuts for the ECC unitary
 
-### Oracle Pattern for Extensibility
+We **do not** use:
 
-Our code uses the **Oracle Pattern** to separate concerns and enable easy integration:
+- Classical **pre-computed lookup tables** of basis transitions (the legacy **`_build_lookup`** / **`mcx`-per-entry** pattern has been **removed** from the ECC path).
+- **Transition matrices** that encode \(P \mapsto P+Q\) as classical tabulation wired into quantum controls.
 
-- **`QuantumOracle`**: Abstract base class defining the oracle interface
-- **`MockPhaseOracle`**: Testing oracle with phase gate P(θ)
-- **`ECCOracle`**: Placeholder for Elliptic Curve Point Addition (ready for integration)
+What **is** classical and allowed:
 
-**Benefits**:
-- **Separation of Concerns**: Oracle handles unitary construction, estimator handles QSP logic
-- **Easy Integration**: Swap `MockPhaseOracle` → `ECCOracle` without changing estimator code
-- **Testability**: Mock oracles enable development and validation
+- **Curve parameters** and fixed **\(Q\)** (same as any implemented oracle definition).
+- **Subgroup point enumeration** \(\langle Q \rangle\) **only** to build the **\(k=1\)** eigenstate coefficients in **`prepare_eigenstate`**, which calls **`initialize`** on the **first \(2\cdot n_{\mathrm{arith}}\)** target qubits (data plane); ancillas remain \(|0\rangle\).
 
-### Code Structure
+The **measured phase statistics** in the ECC demo arise from applying the **quantum arithmetic** unitary (superposition over subgroup points) inside the **QSP** loop—not from indexing a precomputed classical map.
 
+---
+
+## Hardware considerations and execution strategy
+
+**Circuit depth and width.** Mod-\(p\) multiplication and Fermat inversion require **many ancilla qubits** and deep QFT-based stages. As implemented, the **full** ECC oracle plus QSP is **not** a shallow NISQ experiment: it is an **architecture** aimed at **scalable** compilation and simulation, not a claim of fitting today’s superconducting **coherence** budgets end-to-end.
+
+**Simulation (Qiskit Aer).**
+
+- **`QSPPhaseEstimator`** uses the default **`AerSimulator()`** (statevector-style simulation path) for the **mock** oracle and, when memory allows, for **ECC + QSP**.
+- **`ECCOracle`** allocates **data + ancillas**; `main.py` prints a **memory warning** when the oracle’s target qubit count is large. On typical laptops, **end-to-end ECC + QSP** on the **official** JSON curves may **exhaust statevector memory**—this is a **simulation resource** limit, not an assertion that the construction is classical.
+- **`AerSimulator(method="matrix_product_state")`** is used in **`__main__`** for the **ModPInverseOracle** regression block (wide inverse circuit). It is **not** currently wired into **`QSPPhaseEstimator`** for ECC; extending the estimator with an **optional MPS (or other tensor) backend** is a natural follow-up for wide-stack runs.
+
+**Stress testing.** Set **`RUN_ECC_STRESS_TEST = True`** in `if __name__ == "__main__"` to sweep **Q-Day** bit lengths (timeouts / memory may stop the sweep early).
+
+**IBM Quantum.** Set **`RUN_ON_IBM_HARDWARE = True`** and provide **`IBM_QUANTUM_TOKEN`** in a **`.env`** file. The bundled hook runs a **short smoke test** with **`MockPhaseOracle`** (not the full **ECC** stack); it demonstrates **runtime integration** for future **hardware** experiments.
+
+---
+
+## Usage
+
+### Environment
+
+- Use **Python 3.10–3.12** if possible (see comments in [`requirements.txt`](requirements.txt); some Qiskit / Aer builds are unreliable on **3.14+**).
+- Create a virtual environment and install dependencies:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
-main.py
-├── QSP Angle Optimization (Numerical)
-│   ├── qsp_response() - Calculate QSP polynomial
-│   ├── loss_function() - Optimization objective
-│   └── find_optimized_angles() - BFGS optimization
-├── Oracle Pattern
-│   ├── QuantumOracle (Abstract)
-│   ├── MockPhaseOracle (Testing)
-│   └── ECCOracle (Placeholder)
-├── QSP Estimator
-│   ├── QSPPhaseEstimator class
-│   ├── build_qsp_circuit() - Single ancilla circuit
-│   ├── measure_probability() - With noise support
-│   └── estimate_phase_binary_search() - Iterative search
-└── Main Execution
-    ├── Ideal simulation (0% error)
-    └── Noisy simulation (2% error)
+
+### Run the demonstration driver
+
+```bash
+python main.py
+```
+
+### What `main.py` prints (order of sections)
+
+1. **Mock phase oracle — QSP sanity check**  
+   Ideal (**0%**) vs **2% depolarizing** iterative binary search; reports **phase error** in radians and degrees.
+
+2. **ECC + QSP** (when **`RUN_ECC_STRESS_TEST`** is **`False`**, the default)  
+   Loads **`curves/curves.json`** via **`load_qday_curves`**. Default prime size is **`QDAY_CURVE_BITS = 4`**; for **6-bit**, change that constant (or call **`load_qday_curves(bit_length=6)`** in code).  
+   Prints oracle **qubit count**, **expected** \(2\pi/r\), **ideal / noisy** phase estimates, **continued-fraction** candidates for **\(k/r\)**, and whether **\(r\)** matches the JSON **subgroup order**.
+
+3. **Arithmetic validation demos** (regression-style prints)  
+   **`ScalableAdderOracle`**, **`ModPAdderOracle`**, **`ModularMultiplierOracle`**, **`StrictModPAdderOracle`**, then **`ModPInverseOracle`** with **MPS** Aer and **✓/✗** checks.
+
+### Configuration toggles (`main.py`, `if __name__ == "__main__"`)
+
+| Flag | Role |
+|------|------|
+| **`RUN_ECC_STRESS_TEST`** | **`False`**: run single-curve ECC QSP demo. **`True`**: sweep multiple Q-Day bit lengths (heavy). |
+| **`RUN_ON_IBM_HARDWARE`** | **`True`**: IBM Quantum smoke test (**mock** oracle only); requires **`.env`** token. |
+| **`QDAY_CURVE_BITS`** | ECC demo curve size when not stress-testing (e.g. **4** or **6**). |
+
+### What “success” looks like
+
+- **Mock QSP:** Small **phase error** after binary search; noisy case **degraded** but still usable for the demo window.
+- **ECC QSP:** Estimated phase close to **\(2\pi/r\)** (mod \(2\pi\)); continued fractions may recover **\(r\)** matching **`subgroup_order`** in JSON.
+- **Arithmetic blocks:** Printed **✓** for each checked basis state / modulus line.
+
+### QSP–ECC data flow (high level)
+
+```mermaid
+flowchart LR
+  prep[EigenstatePrep_on_data]
+  ctrlU[Controlled_ECC_U]
+  qsp[QSP_layer_Rz_and_scan]
+  meas[Measure_phase_ancilla]
+  prep --> ctrlU --> qsp --> meas
 ```
 
 ---
 
-## Performance Characteristics
+## Repository map
 
-### Resource Requirements
-
-| Approach | Ancilla Qubits | Target Qubits | Total Qubits |
-|----------|---------------|---------------|--------------|
-| **Traditional QPE+QFT** | n | n | 2n |
-| **Our QSP Approach** | **1** | n | **n+1** |
-
-**Example**: For 256-bit precision:
-- Traditional: **512 qubits** (256 ancilla + 256 target)
-- Our approach: **257 qubits** (1 ancilla + 256 target)
-- **Savings**: 255 ancilla qubits (99.8% reduction)
-
-### Precision Scaling
-
-- **Degree 5**: Moderate precision, fast execution
-- **Degree 10**: High precision, reasonable depth
-- **Degree 20**: Very high precision, deeper circuit
-- **Binary Search**: Additional precision through iterations
-
-### Noise Resilience
-
-Our simulations demonstrate:
-- **Ideal (0% error)**: High accuracy phase estimation
-- **Noisy (2% error)**: Graceful degradation, maintains usability
-- **Robustness**: Binary search naturally mitigates noise effects
+| Path | Content |
+|------|---------|
+| [`main.py`](main.py) | QSP angles, oracles (**`ECCOracle`**, adders, inverse), **`QSPPhaseEstimator`**, `__main__` driver |
+| [`curves/curves.json`](curves/curves.json) | Official-format Q-Day curve entries |
+| [`requirements.txt`](requirements.txt) | Python dependencies |
 
 ---
 
-## Key Topics and Foundations
+## Competition reference
 
-### 1. Quantum Signal Processing (QSP)
+**Q-Day Prize** — objective, rules, and submission expectations: [https://www.qdayprize.org/](https://www.qdayprize.org/)
 
-**Core Technique**: QSP allows polynomial transformations of eigenvalues using minimal ancilla qubits.
-
-- **Mathematical Foundation**: QSP sequences encode polynomials in rotation angles
-- **Implementation**: Numerical optimization ensures accurate step function approximation
-- **Advantage**: Single ancilla vs n ancillas for traditional QPE
-
-### 2. Single Ancilla Architecture
-
-**Resource Efficiency**: Our strict single-ancilla constraint enables scalability.
-
-- **Hardware Compatibility**: Runs on current quantum computers
-- **Scalability**: Linear qubit scaling (1 + n) vs exponential (2n)
-- **Practical Impact**: Enables real-world cryptanalysis demonstrations
-
-### 3. Iterative Binary Search
-
-**High Precision Strategy**: Sequential refinement achieves high precision with minimal resources.
-
-- **Algorithm**: Each iteration halves the phase search space
-- **Precision**: 6 iterations = 6 bits = 64 possible values
-- **Robustness**: Natural noise mitigation through averaging
-
-### 4. Robustness and Noise Resilience
-
-**Proven Through Simulation**: Our approach maintains accuracy under realistic noise conditions.
-
-- **Noise Model**: Depolarizing errors (realistic for near-term hardware)
-- **Error Rate**: Tested at 2% depolarizing noise
-- **Results**: Maintains reasonable accuracy, demonstrates practical viability
-
-### 5. Numerical Optimization
-
-**Rigorous Angle Calculation**: No heuristics, mathematically sound optimization.
-
-- **Method**: BFGS gradient-based optimization
-- **Objective**: Minimize distance to target step function
-- **Quality**: High-fidelity polynomial approximation
-
-### 6. Extensibility and Architecture
-
-**Oracle Pattern**: Clean separation enables easy ECC integration.
-
-- **Abstract Interface**: `QuantumOracle` defines contract
-- **Mock Implementation**: `MockPhaseOracle` for testing
-- **ECC Integration**: `ECCOracle` placeholder ready for implementation
-- **Benefits**: Easy to swap oracles without changing estimator logic
-
----
-
-## Shor's Algorithm Context
-
-Shor's algorithm solves the **Elliptic Curve Discrete Logarithm Problem (ECDLP)**, which underpins ECC security. The algorithm consists of:
-
-1. **Order Finding**: Determine the order of a point on the elliptic curve
-2. **Phase Estimation**: Extract phase from a unitary operation (ECC Point Addition)
-3. **Classical Post-Processing**: Use continued fractions to recover the discrete logarithm
-
-**Our Contribution**: We replace the traditional QPE+QFT phase estimation (requiring n ancillas) with QSP-based phase estimation (requiring 1 ancilla), making the algorithm feasible for near-term quantum hardware.
-
----
-
-## Conclusion
-
-This project demonstrates that **QSP-based phase estimation** is not just theoretically interesting, but **practically viable** for breaking ECC on current quantum hardware. By reducing ancilla requirements from n to 1, we enable:
-
-- **Real-world demonstrations** of quantum cryptanalysis
-- **Scalability** to cryptographically relevant key sizes
-- **Robustness** against realistic noise conditions
-- **Extensibility** through clean architecture
-
-Our approach positions us to **win the Q-Day Prize** by demonstrating the largest ECC key break using Shor's algorithm on actual quantum hardware.
-
----
-
-For more information about the Q-Day Prize competition, visit the [Q-Day Prize website](https://www.qdayprize.org/).
+This README describes the **AlphaShor** submission architecture: **single-ancilla QSP**, **lookup-free mod-\(p\)** ECC arithmetic, **Fermat inverse**, and **Bennett uncompute**, with **honest** simulation and hardware scope as implemented in this repository.
