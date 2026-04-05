@@ -14,6 +14,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from scipy.optimize import minimize
 from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.library import QFTGate
 from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_aer import Aer, AerSimulator
 from qiskit.visualization import plot_histogram
@@ -242,28 +243,19 @@ def _ecc_bits_to_int(bits: list) -> int:
 
 def append_qft(circuit: QuantumCircuit, qubits: list):
     """
-    Append in-place QFT to circuit on the given qubits.
-    qubits[0] is LSB (consistent with j = sum_i bit_i * 2^i).
-    For each i: H(qubits[i]); then for each j > i: CP(2*pi/2^(j-i+1)) control=qubits[j], target=qubits[i].
+    Append QFT on the given qubits (qubits[0] is LSB for integer encoding).
+
+    Uses ``QFTGate`` so the transform matches the Draper adder phase convention
+    (bit order / swaps consistent with ``QFTGate.inverse()``).
     """
     n = len(qubits)
-    for i in range(n):
-        circuit.h(qubits[i])
-        for j in range(i + 1, n):
-            angle = 2 * np.pi / (1 << (j - i + 1))
-            circuit.cp(angle, qubits[j], qubits[i])
+    circuit.append(QFTGate(n), qubits)
 
 
 def append_iqft(circuit: QuantumCircuit, qubits: list):
-    """
-    Append inverse QFT (reverse gate order, negate angles).
-    """
+    """Append inverse QFT (inverse of ``QFTGate``)."""
     n = len(qubits)
-    for i in range(n - 1, -1, -1):
-        for j in range(n - 1, i, -1):
-            angle = -2 * np.pi / (1 << (j - i + 1))
-            circuit.cp(angle, qubits[j], qubits[i])
-        circuit.h(qubits[i])
+    circuit.append(QFTGate(n).inverse(), qubits)
 
 
 def construct_circuit_arithmetic(n: int, C: int, N: int = None) -> QuantumCircuit:
@@ -312,6 +304,63 @@ def append_add_constant_fourier_controlled(
         angle = 2 * np.pi * constant * (1 << k) / N
         circuit.cp(angle, control, reg[k])
     append_iqft(circuit, reg)
+
+
+def strict_mod_p_register_bits(p: int) -> int:
+    """
+    Bit width n with 2^n > 2(p-1) so x+y never wraps mod 2^n for x,y in [0, p-1].
+    """
+    if p <= 1:
+        return 1
+    return max(1, math.ceil(math.log2(2 * p)))
+
+
+def append_subtract_p_with_borrow_addback(
+    circuit: QuantumCircuit, reg: list, n: int, p: int, borrow_ancilla: int
+):
+    """
+    Map reg from t to (t mod p) for integers t with 0 <= t <= 2(p-1).
+
+    Implements subtract p in Fourier space, copies the underflow MSB into
+    ``borrow_ancilla``, then conditionally adds p back. For inputs in the
+    stated range this matches the usual add-subtract-controlled reduction.
+    The borrow ancilla is generally entangled (not returned to |0⟩).
+    """
+    append_add_constant_fourier(circuit, reg, n, -p)
+    circuit.cx(reg[n - 1], borrow_ancilla)
+    append_add_constant_fourier_controlled(circuit, reg, n, p, borrow_ancilla)
+
+
+def append_add_constant_mod_p(
+    circuit: QuantumCircuit, reg: list, n: int, p: int, C: int, borrow_ancilla: int
+):
+    """reg := (reg + C) mod p for classical C; assumes 0 <= reg < p on input basis states."""
+    N = 1 << n
+    append_add_constant_fourier(circuit, reg, n, C % N)
+    append_subtract_p_with_borrow_addback(circuit, reg, n, p, borrow_ancilla)
+
+
+def append_add_into_reg_controlled(
+    circuit: QuantumCircuit,
+    reg_r: list,
+    reg_x: list,
+    n: int,
+    N: int,
+    control: int,
+    scratch: int,
+):
+    """
+    When ``control`` is |1⟩, apply R := (R + X) mod N (same as append_add_into_reg).
+    ``scratch`` must be |0⟩; it is returned to |0⟩. O(n^2) Toffoli overhead from ccx uncompute.
+    """
+    append_qft(circuit, reg_r)
+    for k in range(n):
+        for j in range(n):
+            angle = 2 * np.pi * (1 << (j + k)) / N
+            circuit.ccx(control, reg_x[j], scratch)
+            circuit.cp(angle, scratch, reg_r[k])
+            circuit.ccx(control, reg_x[j], scratch)
+    append_iqft(circuit, reg_r)
 
 
 def append_add_into_reg(circuit: QuantumCircuit, reg_r: list, reg_x: list, n: int, N: int):
@@ -522,6 +571,44 @@ class ModPAdderOracle(QuantumOracle):
         circuit.initialize(state, qubits)
 
 
+class StrictModPAdderOracle(QuantumOracle):
+    """
+    Strict GF(p) adder: |x⟩ ↦ |(x + C) mod p⟩ using add–subtract–controlled add-back
+    (QFT constant add, subtract p, borrow MSB into an ancilla, conditional add p).
+
+    Requires 0 ≤ x < p on input basis states and uses n = ceil(log2(2p)) data qubits
+    so x + C does not wrap mod 2^n before reduction. One borrow ancilla is used and
+    may remain entangled (not reset to |0⟩).
+    """
+
+    def __init__(self, p: int, C: int):
+        if p < 2:
+            raise ValueError("p must be >= 2")
+        self._p = p
+        self._C = int(C)
+        self._n = strict_mod_p_register_bits(p)
+
+    def construct_circuit(self) -> QuantumCircuit:
+        n = self._n
+        qc = QuantumCircuit(n + 1)
+        reg = list(range(n))
+        borrow = n
+        append_add_constant_mod_p(qc, reg, n, self._p, self._C, borrow)
+        return qc
+
+    def get_num_target_qubits(self) -> int:
+        return self._n + 1
+
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        n = self._n
+        dim = 1 << (n + 1)
+        state = np.zeros(dim, dtype=complex)
+        for j in range(self._p):
+            state[j] = np.exp(-2j * np.pi * j / self._p) / np.sqrt(self._p)
+        qubits = [target_start_idx + i for i in range(n + 1)]
+        circuit.initialize(state, qubits)
+
+
 class ModularMultiplierOracle(QuantumOracle):
     """
     Modular multiplication: U|x⟩|r⟩ = |x⟩|(a·x + r) mod N⟩.
@@ -568,6 +655,146 @@ class ModularMultiplierOracle(QuantumOracle):
         state = np.zeros(1 << num_q, dtype=complex)
         state[0] = 1.0
         circuit.initialize(state, qubits)
+
+
+def append_mult_mod_p_out_of_place(
+    circuit: QuantumCircuit,
+    reg_out: list,
+    reg_a: list,
+    reg_b: list,
+    n: int,
+    p: int,
+    anc_double: int,
+    scratch_and: int,
+    borrow_qubits: list,
+    reg_a_copy=None,
+):
+    """
+    reg_out := (val(reg_a) * val(reg_b)) mod p with reg_out starting in |0…0⟩;
+    reg_a and reg_b are unchanged (read-only). ``borrow_qubits`` must have length
+    at least 2n (one wire per modular reduction). Gate count O(n^3).
+
+    When ``reg_a`` and ``reg_b`` alias the same register (squaring), pass ``reg_a_copy``
+    (n qubits, initially |0⟩): a coherent copy of ``reg_a`` is created for the
+    controlled add so control qubits stay distinct from addend wires.
+    """
+    N = 1 << n
+    if len(borrow_qubits) < 2 * n:
+        raise ValueError("borrow_qubits must have length >= 2n")
+    same = reg_a is reg_b or reg_a == reg_b
+    if same and reg_a_copy is None:
+        raise ValueError("reg_a_copy required when multiplying a register by itself")
+    add_src = reg_a
+    if same:
+        add_src = reg_a_copy
+        for k in range(n):
+            circuit.cx(reg_a[k], reg_a_copy[k])
+    bi = 0
+    for i in range(n - 1, -1, -1):
+        append_double_reg(circuit, reg_out, n, N, anc_double)
+        append_subtract_p_with_borrow_addback(
+            circuit, reg_out, n, p, borrow_qubits[bi]
+        )
+        bi += 1
+        append_add_into_reg_controlled(
+            circuit, reg_out, add_src, n, N, reg_b[i], scratch_and
+        )
+        append_subtract_p_with_borrow_addback(
+            circuit, reg_out, n, p, borrow_qubits[bi]
+        )
+        bi += 1
+    if same:
+        for k in range(n):
+            circuit.cx(reg_a[k], reg_a_copy[k])
+
+
+class ModPInverseOracle(QuantumOracle):
+    """
+    Modular inverse via Fermat: |x⟩|y⟩ ↦ |x⟩|(y · x^(p-2)) mod p⟩.
+
+    Initialize y = 1 on the second n-qubit register and x on the first to obtain
+    |x⟩|x^{-1} mod p⟩ for x ≢ 0 (mod p). For x = 0 the circuit still acts unitarily;
+    the mathematical inverse does not exist (outputs are not x^{-1}).
+
+    Uses square-and-multiply with out-of-place modular multiplication (double-and-add
+    mod p). Each modular multiply uses its own n-qubit buffer and 2n fresh borrow
+    wires. Qubit count O(n log p) for prime p.
+    """
+
+    def __init__(self, p: int):
+        if p < 3:
+            raise ValueError("ModPInverseOracle requires p >= 3 (need p-2 >= 1)")
+        self._p = p
+        self._n = strict_mod_p_register_bits(p)
+        self._exp_bits = format(p - 2, "b")
+        n = self._n
+        bits = self._exp_bits
+        self._num_mults = (len(bits) - 1) + bits.count("1")
+        self._reg_x = list(range(n))
+        self._reg_y = list(range(n, 2 * n))
+        base_buf = 2 * n
+        self._bufs = []
+        for i in range(self._num_mults):
+            lo = base_buf + i * n
+            self._bufs.append(list(range(lo, lo + n)))
+        after_bufs = base_buf + self._num_mults * n
+        self._anc_double = after_bufs
+        self._scratch = after_bufs + 1
+        ac0 = after_bufs + 2
+        self._reg_acopy = list(range(ac0, ac0 + n))
+        num_borrow = 2 * n * self._num_mults
+        b0 = ac0 + n
+        self._borrow = list(range(b0, b0 + num_borrow))
+        self._num_qubits = b0 + num_borrow
+
+    def construct_circuit(self) -> QuantumCircuit:
+        n = self._n
+        p = self._p
+        qc = QuantumCircuit(self._num_qubits)
+        x = self._reg_x
+        y = self._reg_y
+        bufs = self._bufs
+        ad = self._anc_double
+        sc = self._scratch
+        br = self._borrow
+        ptr = 0
+
+        def borrow_chunk():
+            nonlocal ptr
+            chunk = br[ptr : ptr + 2 * n]
+            ptr += 2 * n
+            return chunk
+
+        buf_i = 0
+        bits = self._exp_bits
+        acopy = self._reg_acopy
+        for k, ch in enumerate(bits):
+            if k > 0:
+                b = bufs[buf_i]
+                buf_i += 1
+                append_mult_mod_p_out_of_place(
+                    qc, b, y, y, n, p, ad, sc, borrow_chunk(), reg_a_copy=acopy
+                )
+                for i in range(n):
+                    qc.swap(b[i], y[i])
+            if ch == "1":
+                b = bufs[buf_i]
+                buf_i += 1
+                append_mult_mod_p_out_of_place(qc, b, y, x, n, p, ad, sc, borrow_chunk())
+                for i in range(n):
+                    qc.swap(b[i], y[i])
+        return qc
+
+    def get_num_target_qubits(self) -> int:
+        return self._num_qubits
+
+    def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
+        """
+        Wide circuits avoid dense ``initialize`` (exponential state dim). Callers
+        that embed this oracle should rely on the all-|0⟩ product state or apply
+        their own preparation on ``target_start_idx`` … ``+ num_qubits - 1``.
+        """
+        pass
 
 
 # ==============================================================================
@@ -1542,6 +1769,65 @@ if __name__ == "__main__":
         result_r = int(r_bits, 2) if r_bits else 0
         expected_r = (a_mul * x) % N_mul
         print(f"  |{x}⟩|0⟩ -> ... |{result_r}⟩  (3*{x} mod {N_mul} = {expected_r}) {'✓' if result_r == expected_r else '✗'}")
+    print(f"{'='*70}\n")
+
+    # ========================================================================
+    # StrictModPAdderOracle: |(x+C) mod p⟩ (not mod 2^n); QFT add–subtract–addback
+    # ========================================================================
+    p_strict, C_strict = 5, 2
+    strict_adder = StrictModPAdderOracle(p=p_strict, C=C_strict)
+    strict_gate = strict_adder.construct_circuit()
+    n_strict = strict_adder._n
+    print(f"StrictModPAdderOracle: p={p_strict}, C={C_strict}, n={n_strict} data + 1 borrow ancilla")
+    print(f"  Circuit depth: {strict_gate.depth()}, gates: {strict_gate.size()}")
+    x_strict = 4
+    qc_strict = QuantumCircuit(strict_adder.get_num_target_qubits())
+    for j in range(n_strict):
+        if (x_strict >> j) & 1:
+            qc_strict.x(j)
+    qc_strict.append(strict_gate, range(strict_adder.get_num_target_qubits()))
+    qc_strict.measure_all()
+    job_strict = sim.run(_transpile_for_local_run(qc_strict, sim), shots=1)
+    key_s = list(job_strict.result().get_counts().keys())[0]
+    meas_s = int(key_s, 2)
+    out_strict = meas_s & ((1 << n_strict) - 1)
+    exp_strict = (x_strict + C_strict) % p_strict
+    ok_strict = out_strict == exp_strict
+    wrong_mod2n = (x_strict + C_strict) % (1 << n_strict)
+    print(
+        f"  |{x_strict}⟩ + {C_strict} mod {p_strict} -> |{out_strict}⟩  (expected {exp_strict}; mod 2^n alone would be {wrong_mod2n}) {'✓' if ok_strict else '✗'}"
+    )
+    print()
+
+    # ========================================================================
+    # ModPInverseOracle: x^(p-2) mod p (Fermat); wide circuit → MPS simulator
+    # ========================================================================
+    inv_oracle = ModPInverseOracle(p=5)
+    n_inv = inv_oracle._n
+    inv_circ = inv_oracle.construct_circuit()
+    print(
+        f"ModPInverseOracle: p=5 (x^3 mod 5), {inv_oracle.get_num_target_qubits()} qubits; "
+        "AerSimulator(method='matrix_product_state')"
+    )
+    print(f"  Circuit depth: {inv_circ.depth()}, gates: {inv_circ.size()}")
+    sim_mps = AerSimulator(method="matrix_product_state")
+    for x_inv in [2, 3, 4]:
+        qc_inv = QuantumCircuit(inv_oracle.get_num_target_qubits())
+        for j in range(n_inv):
+            if (x_inv >> j) & 1:
+                qc_inv.x(j)
+        qc_inv.x(n_inv)
+        qc_inv.compose(inv_circ, range(inv_oracle.get_num_target_qubits()), inplace=True)
+        qc_inv.measure_all()
+        t_inv = transpile(qc_inv, sim_mps, optimization_level=0, seed_transpiler=42)
+        job_inv = sim_mps.run(t_inv, shots=1)
+        key_inv = list(job_inv.result().get_counts().keys())[0]
+        rev_inv = key_inv[::-1]
+        y_inv = sum(int(rev_inv[n_inv + j]) << j for j in range(n_inv))
+        exp_inv = pow(x_inv, 3, 5)
+        print(
+            f"  |{x_inv}⟩|1⟩ -> second reg |{y_inv}⟩  (x^(-1) mod 5 = {exp_inv}) {'✓' if y_inv == exp_inv else '✗'}"
+        )
     print(f"{'='*70}\n")
 
     if RUN_ON_IBM_HARDWARE:
