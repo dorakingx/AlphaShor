@@ -32,13 +32,30 @@ load_dotenv()
 
 
 def _transpile_for_local_run(qc, backend):
-    """Transpile for AerSimulator: optimization_level=0 avoids heavy basis passes."""
-    return transpile(qc, backend, optimization_level=0, seed_transpiler=42)
+    """Transpile for AerSimulator: optimization_level=0 avoids heavy basis passes.
+
+    Do not pass ``backend`` into ``transpile``: AerSimulator's default coupling map
+    caps width (e.g. 30), which rejects wide arithmetic oracles (ECC mod-p path).
+    Execution still uses ``backend`` for ``run`` / noise_model.
+    """
+    _ = backend  # execution uses backend; transpile must not use Aer coupling limits
+    return transpile(
+        qc,
+        optimization_level=0,
+        seed_transpiler=42,
+        basis_gates=["id", "rz", "sx", "x", "cx"],
+    )
 
 
 def _transpile_noiseless_qsp(qc, backend):
-    """Same as local run; noiseless QSP path uses AerSimulator target."""
-    return transpile(qc, backend, optimization_level=0, seed_transpiler=42)
+    """Noiseless QSP path; same transpile rationale as ``_transpile_for_local_run``."""
+    _ = backend
+    return transpile(
+        qc,
+        optimization_level=0,
+        seed_transpiler=42,
+        basis_gates=["id", "rz", "sx", "x", "cx"],
+    )
 
 
 # ==============================================================================
@@ -406,13 +423,38 @@ def append_rotate_left_reg(circuit: QuantumCircuit, reg: list, n: int, i: int):
             circuit.swap(reg[k], reg[n - 1])
 
 
+class _Borrow:
+    """Linear slice allocator over a preallocated borrow wire list."""
+
+    def __init__(self, pool: list):
+        self.pool = pool
+        self.i = 0
+
+    def take(self, n: int) -> list:
+        sl = self.pool[self.i : self.i + n]
+        self.i += n
+        return sl
+
+
 class ECCOracle(QuantumOracle):
     """
-    Elliptic Curve Point Addition Oracle: U|P⟩ = |P + Q⟩.
-    Implements a genuine quantum circuit for point addition on a small curve
-    (e.g. y² = x³ + x + 1 mod 5) using a lookup-table approach with multi-
-    controlled X gates.
+    Elliptic curve point addition U|P⟩ = |P + Q⟩ over GF(p) using reversible
+    modular arithmetic (strict mod-p add/multiply and Fermat inverse). No lookup
+    table and no per-entry mcX synthesis.
+
+    **Prototype limits:** Point at infinity, P = Q, and P = -Q are unsupported.
+
+    **Data layout:** The first ``2 * n_arith`` qubits hold (x_p, y_p); remaining
+    wires are ancillas (stay |0⟩ when using ``prepare_eigenstate``).
+
+    **Bennett-style uncompute:** Build ``forward`` on work + ancillas, writing
+    (x_r, y_r) into zero-initialized output registers; SWAP each data qubit with
+    the corresponding (x_r, y_r) qubit; then apply ``forward.inverse()`` on the
+    same work/ancilla space so garbage is cleared while the swapped result
+    remains on the original data wires. Wrong SWAP/inverse ordering can yield
+    identity on the wrong basis states.
     """
+
     INF_SENTINEL_6 = (1 << 6) - 1  # 63
 
     def __init__(self, curve_params: dict):
@@ -421,22 +463,22 @@ class ECCOracle(QuantumOracle):
         self.a = curve_params.get("a", 1)
         self.b = curve_params.get("b", 1)
         self.Q = curve_params.get("Q")
+        if self.Q is None:
+            raise ValueError("ECCOracle requires classical fixed point Q in curve_params")
+        self._xq, self._yq = int(self.Q[0]) % self.p, int(self.Q[1]) % self.p
         curve = curve_params.get("curve")
         if curve is None:
             curve = EllipticCurve(self.p, self.a, self.b)
         self.curve = curve
-        self.n_bits = _ecc_n_bits(self.p)
-        self.num_qubits = 2 * self.n_bits
-        self._inf_sentinel = (1 << self.num_qubits) - 1
+        self.n_arith = strict_mod_p_register_bits(self.p)
+        self.n_bits = self.n_arith
+        self._inf_sentinel = (1 << (2 * self.n_arith)) - 1
         self._subgroup_points = []
-        self._lookup = {}
-        self._build_lookup()
+        self._enumerate_subgroup_points()
+        self._allocate_registers()
 
-    def _point_to_int(self, point) -> int:
-        return _ecc_point_to_int(point, self.p, self.n_bits, self._inf_sentinel)
-    
-    def _build_lookup(self):
-        """Build subgroup and P -> P+Q mapping using only curve and Q."""
+    def _enumerate_subgroup_points(self):
+        """Subgroup ⟨Q⟩ for eigenstate preparation only (no transition table)."""
         self._subgroup_points = []
         current = None
         for _ in range(self.p * self.p + 2):
@@ -444,54 +486,237 @@ class ECCOracle(QuantumOracle):
             current = self.curve.point_add(current, self.Q)
             if current is None and len(self._subgroup_points) > 1:
                 break
-        order = len(self._subgroup_points)
-        for j in range(order):
-            P = self._subgroup_points[j]
-            R = self.curve.point_add(P, self.Q)  # P + Q
-            idx_p = self._point_to_int(P)
-            idx_r = self._point_to_int(R)
-            self._lookup[idx_p] = idx_r
-    
+
+    def _allocate_registers(self):
+        """First qubits: x_in, y_in (data); then ancillas for arithmetic."""
+        na = self.n_arith
+        num_inv = _fermat_inverse_num_mults(self.p)
+        q = 0
+
+        def take(n):
+            nonlocal q
+            r = list(range(q, q + n))
+            q += n
+            return r
+
+        self._reg_x_in = take(na)
+        self._reg_y_in = take(na)
+        self._reg_xp_c = take(na)
+        self._reg_yp_c = take(na)
+        self._reg_pm1 = take(na)
+        self._reg_dx = take(na)
+        self._buf_neg_dx = take(na)
+        self._reg_dy = take(na)
+        self._buf_neg_dy = take(na)
+        self._reg_inv_y = take(na)
+        self._inv_bufs = [take(na) for _ in range(num_inv)]
+        self._inv_anc = take(1)[0]
+        self._inv_scr = take(1)[0]
+        self._inv_acopy = take(na)
+        self._inv_borrow = take(2 * na * num_inv)
+        self._m_anc = take(1)[0]
+        self._m_scr = take(1)[0]
+        self._m_acopy = take(na)
+        self._reg_lam = take(na)
+        self._buf_lam = take(na)
+        self._buf_lam2 = take(na)
+        self._reg_xr = take(na)
+        self._reg_yr = take(na)
+        self._buf_xtmp = take(na)
+        self._buf_xpdiff = take(na)
+        self._buf_yr_mid = take(na)
+        # Eight modular multiplies in the forward path, each needs 2n borrow wires;
+        # six mod-p adds each need one borrow ancilla (see append_add_*_mod_p).
+        self._borrow_field = take(16 * na + 6)
+        self.num_qubits = q
+
+    def _point_to_int(self, point) -> int:
+        return _ecc_point_to_int(point, self.p, self.n_arith, self._inf_sentinel)
+
+    def _append_ecc_forward(self, qc: QuantumCircuit):
+        na = self.n_arith
+        p = self.p
+        N = 1 << na
+        xq, yq = self._xq, self._yq
+        br = _Borrow(self._borrow_field)
+
+        append_copy_register(qc, self._reg_x_in, self._reg_xp_c, na)
+        append_copy_register(qc, self._reg_y_in, self._reg_yp_c, na)
+        for i in range(na):
+            if ((p - 1) >> i) & 1:
+                qc.x(self._reg_pm1[i])
+
+        append_copy_register(qc, self._reg_xp_c, self._reg_dx, na)
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_neg_dx,
+            self._reg_pm1,
+            self._reg_dx,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        for i in range(na):
+            qc.swap(self._reg_dx[i], self._buf_neg_dx[i])
+        append_add_constant_mod_p(qc, self._reg_dx, na, p, xq, br.take(1)[0])
+
+        append_copy_register(qc, self._reg_yp_c, self._reg_dy, na)
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_neg_dy,
+            self._reg_pm1,
+            self._reg_dy,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        for i in range(na):
+            qc.swap(self._reg_dy[i], self._buf_neg_dy[i])
+        append_add_constant_mod_p(qc, self._reg_dy, na, p, yq, br.take(1)[0])
+
+        qc.x(self._reg_inv_y[0])
+        append_mod_p_fermat_inverse(
+            qc,
+            self._reg_dx,
+            self._reg_inv_y,
+            self._inv_bufs,
+            self._inv_anc,
+            self._inv_scr,
+            self._inv_acopy,
+            self._inv_borrow,
+            p,
+        )
+
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_lam,
+            self._reg_dy,
+            self._reg_inv_y,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+        )
+        for i in range(na):
+            qc.swap(self._buf_lam[i], self._reg_lam[i])
+
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_lam2,
+            self._reg_lam,
+            self._reg_lam,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        for i in range(na):
+            qc.swap(self._buf_lam2[i], self._reg_xr[i])
+        append_add_constant_mod_p(
+            qc, self._reg_xr, na, p, (p - xq) % p, br.take(1)[0]
+        )
+
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_xtmp,
+            self._reg_pm1,
+            self._reg_xp_c,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        append_add_into_mod_p(
+            qc, self._reg_xr, self._buf_xtmp, na, p, N, br.take(1)[0]
+        )
+
+        append_copy_register(qc, self._reg_xp_c, self._buf_xpdiff, na)
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_xtmp,
+            self._reg_pm1,
+            self._reg_xr,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        append_add_into_mod_p(
+            qc, self._buf_xpdiff, self._buf_xtmp, na, p, N, br.take(1)[0]
+        )
+
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_yr_mid,
+            self._reg_lam,
+            self._buf_xpdiff,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+        )
+        for i in range(na):
+            qc.swap(self._buf_yr_mid[i], self._reg_yr[i])
+        append_mult_mod_p_out_of_place(
+            qc,
+            self._buf_xtmp,
+            self._reg_pm1,
+            self._reg_yp_c,
+            na,
+            p,
+            self._m_anc,
+            self._m_scr,
+            br.take(2 * na),
+            reg_a_copy=self._m_acopy,
+        )
+        append_add_into_mod_p(
+            qc, self._reg_yr, self._buf_xtmp, na, p, N, br.take(1)[0]
+        )
+
+        assert br.i == 16 * na + 6
+
     def construct_circuit(self) -> QuantumCircuit:
-        """
-        Construct ECC Point Addition circuit: in-place U|P⟩ = |P+Q⟩.
-        Uses multi-controlled X gates for each (P, qubit) where output bit differs.
-        Target qubit must not be in the control set, so we use the other n-1 qubits as controls.
-        """
-        n = self.num_qubits
-        qc = QuantumCircuit(n)
-        for idx_p, idx_r in self._lookup.items():
-            if idx_p == idx_r:
-                continue
-            bits_p = _ecc_int_to_bits(idx_p, n)
-            bits_r = _ecc_int_to_bits(idx_r, n)
-            for i in range(n):
-                if bits_p[i] != bits_r[i]:
-                    # Control on all qubits except i; target = qubit i
-                    controls = [j for j in range(n) if j != i]
-                    # ctrl_state: LSB = first control qubit (lowest index)
-                    ctrl_state = _ecc_bits_to_int([bits_p[j] for j in controls])
-                    qc.mcx(controls, i, ctrl_state=ctrl_state)
+        fwd = QuantumCircuit(self.num_qubits)
+        self._append_ecc_forward(fwd)
+        qc = QuantumCircuit(self.num_qubits)
+        qc.compose(fwd, inplace=True)
+        for i in range(self.n_arith):
+            qc.swap(self._reg_x_in[i], self._reg_xr[i])
+            qc.swap(self._reg_y_in[i], self._reg_yr[i])
+        qc.compose(fwd.inverse(), inplace=True)
         return qc
-    
+
     def get_num_target_qubits(self) -> int:
-        """Return number of qubits needed to store (x, y)."""
         return self.num_qubits
-    
+
     def prepare_eigenstate(self, circuit: QuantumCircuit, target_start_idx: int):
         """
-        Prepare eigenstate |ψ_k⟩ = (1/√r) Σ_j exp(-2πikj/r)|P_j⟩ (k=1).
-        Uses initialize() with precomputed state vector (no secret k).
+        Prepare eigenstate |ψ_k⟩ = (1/√r) Σ_j exp(-2πikj/r)|P_j⟩ (k=1) on the data
+        register only; ancilla qubits remain |0⟩.
         """
         r = len(self._subgroup_points)
-        dim = 1 << self.num_qubits
+        dim = 1 << (2 * self.n_arith)
         state = np.zeros(dim, dtype=complex)
         for j in range(r):
             idx = self._point_to_int(self._subgroup_points[j])
             phase = -2 * np.pi * 1 * j / r
             state[idx] = np.exp(1j * phase) / np.sqrt(r)
-        qubits = [target_start_idx + i for i in range(self.num_qubits)]
-        circuit.initialize(state, qubits)
+        data_qubits = [target_start_idx + i for i in range(2 * self.n_arith)]
+        circuit.initialize(state, data_qubits)
 
 
 class ScalableAdderOracle(QuantumOracle):
@@ -708,6 +933,82 @@ def append_mult_mod_p_out_of_place(
             circuit.cx(reg_a[k], reg_a_copy[k])
 
 
+def _fermat_inverse_num_mults(p: int) -> int:
+    bits = format(p - 2, "b")
+    return (len(bits) - 1) + bits.count("1")
+
+
+def append_mod_p_fermat_inverse(
+    circuit: QuantumCircuit,
+    reg_x: list,
+    reg_y: list,
+    buf_regs: list,
+    anc_double: int,
+    scratch: int,
+    reg_acopy: list,
+    borrow_all: list,
+    p: int,
+):
+    """
+    |x⟩|y⟩ ↦ |x⟩|(y · x^(p-2)) mod p⟩ with y initialized to 1 on reg_y[0] (LSB qubit).
+    ``buf_regs`` must have length >= _fermat_inverse_num_mults(p); ``borrow_all`` length == 2*n*that.
+    """
+    n = len(reg_x)
+    N = 1 << n
+    bits = format(p - 2, "b")
+    need_mults = _fermat_inverse_num_mults(p)
+    if len(buf_regs) < need_mults or len(borrow_all) < 2 * n * need_mults:
+        raise ValueError("insufficient buffers or borrow wires for Fermat inverse")
+    ptr = 0
+
+    def chunk():
+        nonlocal ptr
+        sl = borrow_all[ptr : ptr + 2 * n]
+        ptr += 2 * n
+        return sl
+
+    buf_i = 0
+    acopy = reg_acopy
+    for k, ch in enumerate(bits):
+        if k > 0:
+            b = buf_regs[buf_i]
+            buf_i += 1
+            append_mult_mod_p_out_of_place(
+                circuit, b, reg_y, reg_y, n, p, anc_double, scratch, chunk(), reg_a_copy=acopy
+            )
+            for i in range(n):
+                circuit.swap(b[i], reg_y[i])
+        if ch == "1":
+            b = buf_regs[buf_i]
+            buf_i += 1
+            append_mult_mod_p_out_of_place(
+                circuit, b, reg_y, reg_x, n, p, anc_double, scratch, chunk()
+            )
+            for i in range(n):
+                circuit.swap(b[i], reg_y[i])
+    assert ptr == 2 * n * need_mults
+
+
+def append_copy_register(circuit: QuantumCircuit, src: list, dst: list, n: int):
+    """Copy computational basis value src → dst (dst must be |0…0⟩)."""
+    for i in range(n):
+        circuit.cx(src[i], dst[i])
+
+
+def append_add_into_mod_p(
+    circuit: QuantumCircuit,
+    reg_t: list,
+    reg_s: list,
+    n: int,
+    p: int,
+    N: int,
+    borrow: int,
+):
+    """reg_t := (reg_t + reg_s) mod p; reg_s unchanged."""
+    append_add_into_reg(circuit, reg_t, reg_s, n, N)
+    append_subtract_p_with_borrow_addback(circuit, reg_t, n, p, borrow)
+
+
 class ModPInverseOracle(QuantumOracle):
     """
     Modular inverse via Fermat: |x⟩|y⟩ ↦ |x⟩|(y · x^(p-2)) mod p⟩.
@@ -748,41 +1049,18 @@ class ModPInverseOracle(QuantumOracle):
         self._num_qubits = b0 + num_borrow
 
     def construct_circuit(self) -> QuantumCircuit:
-        n = self._n
-        p = self._p
         qc = QuantumCircuit(self._num_qubits)
-        x = self._reg_x
-        y = self._reg_y
-        bufs = self._bufs
-        ad = self._anc_double
-        sc = self._scratch
-        br = self._borrow
-        ptr = 0
-
-        def borrow_chunk():
-            nonlocal ptr
-            chunk = br[ptr : ptr + 2 * n]
-            ptr += 2 * n
-            return chunk
-
-        buf_i = 0
-        bits = self._exp_bits
-        acopy = self._reg_acopy
-        for k, ch in enumerate(bits):
-            if k > 0:
-                b = bufs[buf_i]
-                buf_i += 1
-                append_mult_mod_p_out_of_place(
-                    qc, b, y, y, n, p, ad, sc, borrow_chunk(), reg_a_copy=acopy
-                )
-                for i in range(n):
-                    qc.swap(b[i], y[i])
-            if ch == "1":
-                b = bufs[buf_i]
-                buf_i += 1
-                append_mult_mod_p_out_of_place(qc, b, y, x, n, p, ad, sc, borrow_chunk())
-                for i in range(n):
-                    qc.swap(b[i], y[i])
+        append_mod_p_fermat_inverse(
+            qc,
+            self._reg_x,
+            self._reg_y,
+            self._bufs,
+            self._anc_double,
+            self._scratch,
+            self._reg_acopy,
+            self._borrow,
+            self._p,
+        )
         return qc
 
     def get_num_target_qubits(self) -> int:
@@ -1436,7 +1714,7 @@ if __name__ == "__main__":
     RUN_ON_IBM_HARDWARE = False
     # Set True to sweep Q-Day bit lengths (can be slow / memory-heavy at high bits).
     RUN_ECC_STRESS_TEST = False
-    # ECC lookup-table circuits are heavy to transpile/simulate; lower shots keeps runtime practical.
+    # ECC arithmetic oracles are wide (data + many ancillas); lower shots keeps runtime practical.
     _ECC_DEMO_SHOTS = 512
 
     actual_phase = (2/3) * np.pi 
@@ -1625,6 +1903,11 @@ if __name__ == "__main__":
         }
         ecc_oracle = ECCOracle(curve_params)
         print(f"ECCOracle: {ecc_oracle.get_num_target_qubits()} target qubits, subgroup order {len(ecc_oracle._subgroup_points)}")
+        if ecc_oracle.get_num_target_qubits() > 34:
+            print(
+                "  Note: Wide mod-p ECC may exceed practical Aer statevector memory; "
+                "binary search below can fail at runtime unless you use a smaller curve or another backend."
+            )
 
         expected_phase = 2 * np.pi / order_r
         print(f"Expected phase (eigenstate k=1): 2π/r = {expected_phase:.6f} rad ({np.degrees(expected_phase):.2f}°)")
@@ -1686,7 +1969,7 @@ if __name__ == "__main__":
         print(f"{'='*70}")
         print(f"Curve: y² = x³ + {b} (mod {p}), a={a}")
         print(f"Generator G (oracle fixed point): {G}, subgroup order r: {order_r}")
-        print(f"ECCOracle: U|P⟩ = |P+Q⟩ (lookup-table, no classical cheating)")
+        print(f"ECCOracle: U|P⟩ = |P+Q⟩ (mod-p arithmetic + Bennett uncompute; no lookup table)")
         print(f"\nIdeal (0% error):  Phase error = {error_ideal:.6f} rad")
         print(f"Noisy (2% error):  Phase error = {error_noisy:.6f} rad")
         print(f"\n{'='*70}\n")
