@@ -1,5 +1,11 @@
 # AlphaShor: Scalable Quantum Cryptanalysis for the Q-Day Prize
 
+## Submission Details
+* **Length of the key broken:** 4-bit (Official Q-Day standard curve from `curves.json`)
+* **Model of quantum computer used:** Rigorous Classical Simulation (Qiskit `AerSimulator` with `matrix_product_state` method)
+* **Specs of quantum computer & Access method:** Simulated locally on standard hardware. Code includes integration for IBM Quantum (`QiskitRuntimeService` via `SamplerV2`) for future hardware deployment.
+* **Instructions for running:** See the [Usage](#usage) section below.
+
 ## Executive summary
 
 **AlphaShor** targets the **elliptic-curve discrete logarithm problem (ECDLP)** in the spirit of Shor’s period-finding / phase-estimation pipeline. The repository implements a **pure, scalable quantum circuit** for **fixed-point elliptic-curve addition** $U|P\rangle = |P+Q\rangle$ over $\mathbb{F}_p$, built from **reversible modular arithmetic** (QFT-based adders and out-of-place mod-$p$ multiplication). We **do not** synthesize that unitary from a classical transition table.
